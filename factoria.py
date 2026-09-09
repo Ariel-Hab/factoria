@@ -1406,16 +1406,56 @@ def regenerar_indice() -> Path:
 # --------------------------------------------------------------------------
 
 
+def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None) -> str:
+    """Que rama registra el ticket, creandola si hace falta.
+
+    Sin --rama se usa la rama actual del repo, y ahi esta el pozo: si el repo
+    quedo parado en una feature ajena, el ticket nuevo la registra como si fuera
+    la suya y los commits caen en la rama de otra tarea. Por eso se avisa.
+    """
+    if not pedida:
+        if actual and base and actual != base:
+            console.print(
+                f"[yellow]Ojo:[/] el ticket va a quedar registrado en "
+                f"[bold]{actual}[/], que no es la base ({base}).\n"
+                f"[dim]Si esta tarea es nueva, cancelá y corré con "
+                f"--rama <nombre> para crearla desde {base}.[/]\n"
+            )
+        return actual
+    existe = git(rp, "rev-parse", "--verify", "--quiet", f"refs/heads/{pedida}")
+    sucio = git(rp, "status", "--porcelain")
+    if sucio:
+        raise click.ClickException(
+            f"{rp.name} tiene cambios sin commitear: cambiar de rama ahora los "
+            f"arrastraria a '{pedida}'. Resolvelos y volvé a correr.\n" + sucio[:400]
+        )
+    if existe:
+        r = subprocess.run(["git", "-C", str(rp), "checkout", pedida],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+        console.print(f"[dim]checkout de la rama existente {pedida}[/]")
+    else:
+        r = subprocess.run(["git", "-C", str(rp), "checkout", "-b", pedida, base],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+        console.print(f"[dim]rama nueva {pedida} desde {base}[/]")
+    if r.returncode != 0:
+        raise click.ClickException(f"git checkout falló:\n{(r.stderr or '').strip()[:400]}")
+    return git(rp, "rev-parse", "--abbrev-ref", "HEAD") or pedida
+
+
 @cli.command()
 @click.argument("slug")
 @click.option("--repo", help="Repo donde arranca. Por defecto, el del directorio actual.")
 @click.option("--cuenta", type=click.Choice(list(CUENTAS)),
               help="Override del perfil del repo.")
 @click.option("--pedido", help="El pedido crudo, literal. Sin esto se abre el editor.")
+@click.option("--rama", "rama_pedida", help="Rama del trabajo. La crea desde la base si "
+                                            "no existe. Sin esto se usa la rama actual.")
 @click.option("--no-lanzar", is_flag=True, help="Crear el ticket sin abrir la sesion.")
 @click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
 def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
-        no_lanzar: bool, forzar: bool) -> None:
+        rama_pedida: str | None, no_lanzar: bool, forzar: bool) -> None:
     """Crea un ticket en fase plan y abre su sesion, con id conocido de antemano."""
     crudo, slug = slug, normalizar_slug(slug)
     if not slug:
@@ -1457,7 +1497,9 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
         raise click.ClickException("el pedido crudo quedo vacio: sin eso el ticket no sirve.")
 
     sid = str(uuid.uuid4())
-    rama = git(rp, "rev-parse", "--abbrev-ref", "HEAD") or ""
+    base = perfil(rp.name).get("base") or base_de(rp) or ""
+    actual = git(rp, "rev-parse", "--abbrev-ref", "HEAD") or ""
+    rama = _resolver_rama(rp, base, actual, rama_pedida)
     doc = crear_doc(rp.name, slug)
     t = Ticket(
         slug=slug, fase="plan", abierto=True, spec_congelado="",
