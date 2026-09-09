@@ -19,10 +19,12 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import click
+import yaml
 from rich.console import Console
 from rich.table import Table
 
@@ -489,6 +491,7 @@ class Relevamiento:
     sesiones: list[Sesion] = field(default_factory=list)
     contratos: list[tuple[str, int]] = field(default_factory=list)
     estado_actual: dict[str, tuple[int, int]] = field(default_factory=dict)
+    tickets: list["Ticket"] = field(default_factory=list)
 
 
 def relevar() -> Relevamiento:
@@ -503,7 +506,32 @@ def relevar() -> Relevamiento:
             rel.estado_actual[repo.name] = ca
     rel.sesiones = inventario_sesiones()
     rel.contratos = cotas_contratos()
+    rel.tickets = tickets_todos()
     return rel
+
+
+def _tiene_items(cuerpo: str, encabezado: str) -> bool:
+    """Si una seccion tiene algun bullet con texto real. Los comentarios HTML de
+    la plantilla y los guiones sueltos no cuentan."""
+    lineas = cuerpo.splitlines()
+    try:
+        i = next(n for n, l in enumerate(lineas) if l.strip() == encabezado)
+    except StopIteration:
+        return False
+    dentro = False
+    for l in lineas[i + 1:]:
+        if l.startswith("## "):
+            break
+        t = l.strip()
+        if t.startswith("<!--"):
+            dentro = True
+        if dentro:
+            if "-->" in t:
+                dentro = False
+            continue
+        if t.startswith(("-", "*")) and len(t.lstrip("-*[ ]x").strip()) > 2:
+            return True
+    return False
 
 
 def hallazgos(rel: Relevamiento) -> list[str]:
@@ -581,6 +609,46 @@ def hallazgos(rel: Relevamiento) -> list[str]:
             + "  ->  factoria sesiones --paralelas"
         )
 
+    # --- Tickets: el estandar §3 medido desde afuera, que es el unico modo en
+    # que una cota sobrevive. Las de los .md se auto-vigilaban y decayeron.
+    gordos = [t for t in rel.tickets if t.lineas > COTA_TICKET]
+    if gordos:
+        h.append(
+            f"[yellow]cota[/] {len(gordos)} tickets pasan {COTA_TICKET} lineas: "
+            + ", ".join(f"{t.slug} ({t.lineas})" for t in gordos[:3])
+            + ". El handoff de fase va a .factoria/handoffs/, no adentro del ticket"
+        )
+    sin_ses = [(t, e) for t in rel.tickets if t.abierto
+               for e in t.repos if not e.session_id]
+    if sin_ses:
+        h.append(
+            f"[yellow]sesion[/] {len(sin_ses)} entradas de ticket sin session_id: "
+            + ", ".join(f"{t.slug}/{e.repo}" for t, e in sin_ses[:3])
+            + ". Sin eso `resume` no las encuentra"
+        )
+    # Un ticket abierto cuyo .jsonl no esta en disco: el id quedo reservado y
+    # nunca se abrio, o se borro la sesion. Los dos casos rompen `resume`.
+    huerfanas = [
+        (t, e) for t in rel.tickets if t.abierto
+        for e in t.repos if e.session_id and not jsonl_de(e.session_id, e.cuenta)
+    ]
+    if huerfanas:
+        h.append(
+            f"[yellow]sesion[/] {len(huerfanas)} sesiones de ticket reservadas pero sin "
+            ".jsonl en disco (nunca abiertas, o borradas): "
+            + ", ".join(f"{t.slug}/{e.repo}" for t, e in huerfanas[:3])
+        )
+    en_plan = [t for t in rel.tickets if t.abierto and t.fase == "plan"
+               and "## Supuestos abiertos" in t.cuerpo
+               and not _tiene_items(t.cuerpo, "## Supuestos abiertos")]
+    if en_plan:
+        h.append(
+            f"[yellow]spec[/] {len(en_plan)} tickets en fase plan con 'Supuestos abiertos' "
+            "vacio: " + ", ".join(t.slug for t in en_plan[:3])
+            + ". Esa seccion vacia no significa que no haya supuestos, significa que no "
+            "se escribieron"
+        )
+
     sin_estado = [d for d in rel.docs if not d.explicito]
     if sin_estado:
         h.append(
@@ -642,12 +710,31 @@ def board(docs: bool, ramas: bool, sesiones: bool, limite: int, como_json: bool)
         }, indent=2, ensure_ascii=False, default=str))
         return
 
+    abiertos = [t for t in rel.tickets if t.abierto]
     console.print()
     console.print(
         f"[bold]factoria board[/]  |  {len(rel.repos)} repos  |  "
-        f"{len(rel.docs)} docs  |  {len(rel.ramas)} ramas sin mergear  |  "
-        f"{len(rel.sesiones)} sesiones"
+        f"{len(abiertos)} tickets  |  {len(rel.docs)} docs  |  "
+        f"{len(rel.ramas)} ramas sin mergear  |  {len(rel.sesiones)} sesiones"
     )
+
+    if abiertos:
+        t = Table(title="Tickets en vuelo", title_justify="left", header_style="bold")
+        t.add_column("slug", overflow="fold")
+        t.add_column("fase")
+        t.add_column("repos")
+        t.add_column("ses")
+        t.add_column("lin", justify="right")
+        for tk in sorted(abiertos, key=lambda x: (FASES.index(x.fase) if x.fase in FASES else 9,
+                                                  x.slug))[:limite]:
+            con_ses = sum(1 for e in tk.repos if e.session_id)
+            t.add_row(tk.slug, tk.fase,
+                      ", ".join(f"{e.repo}({e.cuenta})" for e in tk.repos) or "[red]-[/]",
+                      f"{con_ses}/{len(tk.repos)}", str(tk.lineas))
+        console.print(t)
+
+    # El indice se regenera aca y no en cada `new`/`fase`: es derivado.
+    regenerar_indice()
 
     if docs and rel.docs:
         t = Table(title="Docs de trabajo", title_justify="left", header_style="bold")
@@ -726,20 +813,20 @@ def _render_sesiones(ss: list[Sesion], encabezado: str = "") -> None:
         console.print(f"      [dim]{s.rama or '(sin rama)'}[/]{extra}")
 
 
-def _lanzar(s: Sesion, args: list[str], forzar: bool, imprimir: bool) -> None:
-    """Arranca claude con la cuenta y el cwd registrados de la sesion."""
-    binario = shutil.which("claude")
-    cmd = ["claude", *args]
-    receta = (f'set CLAUDE_CONFIG_DIR={s.config_dir}\n'
-              f'cd /d {s.cwd}\n'
-              f'{" ".join(cmd)}')
+def _lanzar_en(cuenta: str, cwd: str, args: list[str], forzar: bool, imprimir: bool,
+               nota: str = "") -> None:
+    """Arranca claude con el CLAUDE_CONFIG_DIR de la cuenta y el cwd dados."""
+    config_dir = CUENTAS[cuenta]
+    receta = (f"set CLAUDE_CONFIG_DIR={config_dir}\n"
+              f"cd /d {cwd}\n"
+              f'claude {" ".join(args)}')
     if imprimir:
         console.print(receta)
         return
-    if not s.cwd_existe:
+    if not cwd or not Path(cwd).is_dir():
         raise click.ClickException(
-            f"el cwd registrado ya no existe: {s.cwd}\n"
-            "La sesion sigue en disco; si el worktree se borro, recrealo o usa --imprimir."
+            f"el cwd registrado no existe: {cwd or '(vacio)'}\n"
+            "Si el worktree se borro, recrealo; o usa --imprimir para ver el comando."
         )
     if os.environ.get("CLAUDECODE") and not forzar:
         console.print(
@@ -749,12 +836,13 @@ def _lanzar(s: Sesion, args: list[str], forzar: bool, imprimir: bool) -> None:
         console.print(receta)
         console.print("\n[dim](o --forzar si de verdad querias anidarla)[/]")
         return
+    binario = shutil.which("claude")
     if not binario:
         raise click.ClickException("no encuentro `claude` en el PATH.")
     entorno = os.environ.copy()
-    entorno["CLAUDE_CONFIG_DIR"] = str(s.config_dir)
-    console.print(f"[dim]{s.cuenta} | {s.cwd} | {s.rama or '(sin rama)'}[/]")
-    subprocess.run([binario, *args], cwd=s.cwd, env=entorno)
+    entorno["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    console.print(f"[dim]{cuenta} | {cwd}{' | ' + nota if nota else ''}[/]")
+    subprocess.run([binario, *args], cwd=cwd, env=entorno)
 
 
 def _elegir_una(ss: list[Sesion], consulta: str, elegir: int | None,
@@ -859,51 +947,595 @@ def sesiones(repo: str | None, rama: str | None, cuenta: str | None, dias: int,
     console.print()
 
 
+@dataclass
+class Destino:
+    """A donde apunta un `resume`/`cortar`, venga de un ticket o de una busqueda."""
+    cuenta: str
+    cwd: str
+    session_id: str
+    nota: str = ""
+    existe: bool = True   # el .jsonl ya esta en disco
+    mb: float = 0.0
+    origen: str = "sesion"
+
+
+def jsonl_de(session_id: str, cuenta: str) -> Path | None:
+    if not session_id or cuenta not in CUENTAS:
+        return None
+    base = CUENTAS[cuenta] / "projects"
+    if not base.is_dir():
+        return None
+    return next(base.rglob(f"{session_id}.jsonl"), None)
+
+
+def resolver_destino(consulta: str, repo: str | None, cuenta: str | None,
+                     elegir: int | None, dias: int, accion: str) -> Destino:
+    """El ticket manda: es la clave primaria de una tarea. Solo si el slug no
+    matchea ningun ticket se cae a la busqueda por texto sobre las sesiones."""
+    t = next((x for x in tickets_todos()
+              if x.slug == consulta or consulta.lower() in x.slug.lower()), None)
+    if t:
+        entradas = t.repos
+        if repo:
+            entradas = [e for e in entradas if repo.lower() in e.repo.lower()]
+        if cuenta:
+            entradas = [e for e in entradas if e.cuenta == cuenta]
+        if not entradas:
+            raise click.ClickException(
+                f"el ticket '{t.slug}' no tiene entrada para esos filtros. Repos: "
+                + ", ".join(f"{e.repo}({e.cuenta})" for e in t.repos)
+            )
+        if len(entradas) > 1:
+            raise click.ClickException(
+                f"'{t.slug}' tiene {len(entradas)} repos. Elegí uno con --repo: "
+                + ", ".join(f"{e.repo}({e.cuenta})" for e in entradas)
+            )
+        e = entradas[0]
+        j = jsonl_de(e.session_id, e.cuenta)
+        return Destino(
+            cuenta=e.cuenta, cwd=e.cwd, session_id=e.session_id,
+            nota=f"{e.repo} | {e.rama or '(sin rama)'} | fase {t.fase}",
+            existe=j is not None,
+            mb=(j.stat().st_size / 1_048_576) if j else 0.0,
+            origen=f"ticket {t.slug}",
+        )
+    ss = buscar_sesiones(consulta, cuenta, dias or None)
+    if repo:
+        ss = [s for s in ss if repo.lower() in s.repo.lower()]
+    s = _elegir_una(ss, consulta, elegir, accion)
+    return Destino(cuenta=s.cuenta, cwd=s.cwd, session_id=s.session_id,
+                   nota=s.rama or "(sin rama)", existe=True, mb=s.mb)
+
+
 @cli.command()
 @click.argument("consulta")
+@click.option("--repo", help="Cuando el ticket tiene sesiones en varios repos.")
 @click.option("--cuenta", type=click.Choice(list(CUENTAS)), help="Acotar a una cuenta.")
 @click.option("--elegir", type=int, help="Indice de la lista cuando matchean varias.")
 @click.option("--dias", default=0, help="Solo sesiones de hace <= N dias. 0 = todas.")
 @click.option("--imprimir", is_flag=True, help="Mostrar el comando sin ejecutarlo.")
 @click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
-def resume(consulta: str, cuenta: str | None, elegir: int | None, dias: int,
-           imprimir: bool, forzar: bool) -> None:
+def resume(consulta: str, repo: str | None, cuenta: str | None, elegir: int | None,
+           dias: int, imprimir: bool, forzar: bool) -> None:
     """Reanuda la sesion de una tarea: continua la conversacion, no abre otra."""
-    ss = buscar_sesiones(consulta, cuenta, dias or None)
-    s = _elegir_una(ss, consulta, elegir, "resume")
-    if s.mb >= UMBRAL_SESION_MB:
+    d = resolver_destino(consulta, repo, cuenta, elegir, dias, "resume")
+    if not d.existe:
+        # Ticket recien creado con --no-lanzar: el id esta reservado pero el
+        # .jsonl todavia no existe, asi que `-r` no lo encontraria.
+        console.print(f"[dim]{d.origen}: primera apertura, sesion {d.session_id}[/]")
+        _lanzar_en(d.cuenta, d.cwd, ["--session-id", d.session_id], forzar, imprimir, d.nota)
+        return
+    if d.mb >= UMBRAL_SESION_MB:
         console.print(
-            f"[yellow]Ojo:[/] esta sesion pesa {s.mb:.1f} MB (umbral {UMBRAL_SESION_MB}). "
+            f"[yellow]Ojo:[/] esta sesion pesa {d.mb:.1f} MB (umbral {UMBRAL_SESION_MB}). "
             "Cada turno paga lectura de cache sobre todo ese prefijo.\n"
             f"[dim]Alternativa: factoria cortar {consulta} --fork[/]\n"
         )
-    _lanzar(s, ["-r", s.session_id], forzar, imprimir)
+    _lanzar_en(d.cuenta, d.cwd, ["-r", d.session_id], forzar, imprimir, d.nota)
 
 
 @cli.command()
 @click.argument("consulta")
 @click.option("--fork", is_flag=True,
               help="Ramificar desde la sesion actual, preservandola intacta.")
+@click.option("--repo", help="Cuando el ticket tiene sesiones en varios repos.")
 @click.option("--cuenta", type=click.Choice(list(CUENTAS)))
 @click.option("--elegir", type=int)
 @click.option("--imprimir", is_flag=True)
 @click.option("--forzar", is_flag=True)
-def cortar(consulta: str, fork: bool, cuenta: str | None, elegir: int | None,
-           imprimir: bool, forzar: bool) -> None:
+def cortar(consulta: str, fork: bool, repo: str | None, cuenta: str | None,
+           elegir: int | None, imprimir: bool, forzar: bool) -> None:
     """Corta una sesion cara. Con --fork ramifica; sin el, arranca limpia."""
-    ss = buscar_sesiones(consulta, cuenta, None)
-    s = _elegir_una(ss, consulta, elegir, "cortar")
+    d = resolver_destino(consulta, repo, cuenta, elegir, 0, "cortar")
     if fork:
-        _lanzar(s, ["-r", s.session_id, "--fork-session"], forzar, imprimir)
+        if not d.existe:
+            raise click.ClickException(
+                f"la sesion {d.session_id} todavia no existe en disco: no hay de donde "
+                f"ramificar. Abrila primero con `factoria resume {consulta}`."
+            )
+        _lanzar_en(d.cuenta, d.cwd, ["-r", d.session_id, "--fork-session"],
+                   forzar, imprimir, d.nota)
         return
     console.print(
-        f"[yellow]Sesion nueva y limpia[/] en {s.cwd} ({s.cuenta}), rama "
-        f"{s.rama or '(sin rama)'}.\n"
-        f"[dim]La anterior queda intacta: factoria resume {consulta} --elegir 1[/]\n"
+        f"[yellow]Sesion nueva y limpia[/] en {d.cwd} ({d.cuenta}) | {d.nota}\n"
+        f"[dim]La anterior queda intacta: factoria resume {consulta}[/]\n"
         "[dim]El pack de contexto automatico (`factoria contexto`) llega en el paso 6; "
         "por ahora la sesion arranca solo con el CLAUDE.md del repo.[/]\n"
     )
-    _lanzar(s, [], forzar, imprimir)
+    _lanzar_en(d.cuenta, d.cwd, [], forzar, imprimir, d.nota)
+
+
+# --------------------------------------------------------------------------
+# Tickets y docs de trabajo (paso 4). El estandar de documentacion del plan §3
+# no se declara en un .md: se materializa en las plantillas y lo mide `board`.
+# Toda cota que se auto-vigilaba decayo.
+# --------------------------------------------------------------------------
+
+FASES = ("plan", "dev", "test", "cerrado")
+COTA_TICKET = 120
+RE_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+RE_FRONT = re.compile(r"\A---\s*\n(.*?)\n---[ \t]*\n?", re.S)
+
+
+@dataclass
+class RepoTicket:
+    repo: str
+    cuenta: str
+    rama: str = ""
+    cwd: str = ""
+    session_id: str = ""
+    doc: str = ""
+
+
+@dataclass
+class Ticket:
+    slug: str
+    fase: str = "plan"
+    abierto: bool = True
+    spec_congelado: str = ""
+    repos: list[RepoTicket] = field(default_factory=list)
+    cuerpo: str = ""
+    path: Path | None = None
+
+    def entrada(self, repo: str) -> RepoTicket | None:
+        r = repo.lower()
+        return next((e for e in self.repos if e.repo.lower() == r), None)
+
+    def texto(self) -> str:
+        fm = {
+            "slug": self.slug,
+            "fase": self.fase,
+            "abierto": self.abierto,
+            "spec_congelado": self.spec_congelado,
+            "repos": [dict(vars(e)) for e in self.repos],
+        }
+        y = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True,
+                           default_flow_style=False).rstrip()
+        return f"---\n{y}\n---\n\n{self.cuerpo.lstrip()}"
+
+    @property
+    def lineas(self) -> int:
+        return len(self.texto().splitlines())
+
+
+def leer_ticket(p: Path) -> Ticket | None:
+    try:
+        txt = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = RE_FRONT.match(txt)
+    if not m:
+        return None
+    try:
+        fm = yaml.safe_load(m.group(1))
+    except yaml.YAMLError:
+        return None
+    if not isinstance(fm, dict):
+        return None
+    repos = [
+        RepoTicket(
+            repo=str(e.get("repo", "")), cuenta=str(e.get("cuenta", "")),
+            rama=str(e.get("rama") or ""), cwd=str(e.get("cwd") or ""),
+            session_id=str(e.get("session_id") or ""), doc=str(e.get("doc") or ""),
+        )
+        for e in (fm.get("repos") or [])
+        if isinstance(e, dict) and e.get("repo")
+    ]
+    return Ticket(
+        slug=str(fm.get("slug") or p.stem),
+        fase=str(fm.get("fase") or "plan"),
+        abierto=bool(fm.get("abierto", True)),
+        spec_congelado=str(fm.get("spec_congelado") or ""),
+        repos=repos,
+        cuerpo=txt[m.end():],
+        path=p,
+    )
+
+
+def escribir_ticket(t: Ticket) -> None:
+    assert t.path is not None
+    t.path.parent.mkdir(parents=True, exist_ok=True)
+    t.path.write_text(t.texto(), encoding="utf-8", newline="\n")
+
+
+def dir_tickets() -> Path:
+    return DATOS / "tickets"
+
+
+def tickets_todos() -> list[Ticket]:
+    d = dir_tickets()
+    if not d.is_dir():
+        return []
+    return [t for p in sorted(d.glob("*.md")) if (t := leer_ticket(p))]
+
+
+def buscar_ticket(slug: str) -> Ticket:
+    p = dir_tickets() / f"{slug}.md"
+    t = leer_ticket(p) if p.is_file() else None
+    if t:
+        return t
+    # Coincidencia parcial: los slugs son largos y tipearlos completos es friccion.
+    cands = [x for x in tickets_todos() if slug.lower() in x.slug.lower()]
+    if len(cands) == 1:
+        return cands[0]
+    if not cands:
+        raise click.ClickException(
+            f"no hay ticket que matchee '{slug}'. `factoria tickets` lista los que hay."
+        )
+    raise click.ClickException(
+        "ambiguo, matchean: " + ", ".join(c.slug for c in cands[:8])
+    )
+
+
+# --------------------------------------------------------------------------
+# Perfiles por repo
+# --------------------------------------------------------------------------
+
+# `docs: ai-tasks` = el repo versiona sus docs y van adentro (Cotizaciones).
+# `docs: central`  = el repo los ignora, asi que van al repo de datos, donde si
+#                    tienen historial y respaldo (defeve ignora `.ia/` entero).
+PERFIL_DEFECTO = {"cuenta": "dfv", "docs": "central"}
+
+
+def ruta_repo(nombre: str) -> Path | None:
+    n = nombre.lower()
+    repos = descubrir_repos()
+    for r in repos:
+        if r.name.lower() == n:
+            return r
+    cands = [r for r in repos if n in r.name.lower()]
+    return cands[0] if len(cands) == 1 else None
+
+
+def perfil(repo: str) -> dict:
+    p = DATOS / "profiles" / f"{repo}.yml"
+    if p.is_file():
+        try:
+            d = yaml.safe_load(p.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(d, dict):
+                return {**PERFIL_DEFECTO, **d}
+        except (OSError, yaml.YAMLError):
+            pass
+    return dict(PERFIL_DEFECTO)
+
+
+def cuenta_dominante() -> dict[str, str]:
+    """Con que cuenta trabajas cada repo, segun el historial real de sesiones.
+
+    Poner `dfv` por defecto en todos seria adivinar, y adivina mal:
+    dfv-automatizacion tiene 12 sesiones en `personal` contra 8 en `dfv`.
+    """
+    conteo: dict[str, dict[str, int]] = {}
+    for s in inventario_sesiones():
+        if s.repo:
+            conteo.setdefault(s.repo, {}).setdefault(s.cuenta, 0)
+            conteo[s.repo][s.cuenta] += 1
+    return {repo: max(c, key=c.get) for repo, c in conteo.items() if c}
+
+
+def sembrar_perfiles(sobrescribir: bool = False) -> list[str]:
+    """Genera un perfil por repo descubierto, detectando la convencion de docs."""
+    d = DATOS / "profiles"
+    d.mkdir(parents=True, exist_ok=True)
+    dominante = cuenta_dominante()
+    escritos = []
+    for r in descubrir_repos():
+        p = d / f"{r.name}.yml"
+        if p.is_file() and not sobrescribir:
+            continue
+        pf = {
+            "cuenta": dominante.get(r.name, "dfv"),
+            "docs": "ai-tasks" if (r / ".ai" / "tasks").is_dir() else "central",
+            "base": base_de(r) or "main",
+        }
+        p.write_text(
+            "# Perfil de repo para factoria. `docs: ai-tasks` mete el doc de trabajo\n"
+            "# adentro del repo (.ai/tasks/); `central` lo manda a .factoria/docs/<repo>/\n"
+            "# porque el repo lo ignoraria.\n"
+            "#\n"
+            "# `cuenta` sale del historial real de sesiones de este repo, no de un\n"
+            "# default. Si no habia sesiones, quedo en dfv: corregilo a mano.\n"
+            + yaml.safe_dump(pf, sort_keys=False, allow_unicode=True),
+            encoding="utf-8", newline="\n",
+        )
+        escritos.append(r.name)
+    return escritos
+
+
+def ruta_doc(repo: str, slug: str) -> Path:
+    if perfil(repo).get("docs") == "ai-tasks":
+        rp = ruta_repo(repo)
+        if rp:
+            return rp / ".ai" / "tasks" / f"{slug}.md"
+    return DATOS / "docs" / repo / f"{slug}.md"
+
+
+# --------------------------------------------------------------------------
+# Plantillas: el estandar §3, hecho artefacto
+# --------------------------------------------------------------------------
+
+CUERPO_TICKET = """# {slug}
+
+## Pedido crudo
+
+{pedido}
+
+## Criterios de aceptación
+
+<!-- Uno por linea, cada uno respondible con si/no y nombrando SU evidencia.
+     "funciona bien" no es un criterio; "el listado ordena por fecha desc y el
+     test X lo cubre" si. Los escribe la sesion con vos, no vos solo. -->
+
+- [ ]
+
+## Fuera de alcance
+
+<!-- Lo que se decidio NO hacer. Existe para que nadie lo agregue de onda
+     despues, y para que `aprobar` pueda congelarlo. -->
+
+-
+
+## Supuestos abiertos
+
+<!-- Cada cosa que el modelo tuvo que adivinar, escrita COMO adivinanza y antes
+     de que exista codigo. Es el unico lugar donde una mala interpretacion se
+     puede atajar barata. Si esta seccion queda vacia en fase plan, no se
+     entendio el pedido: se entendio lo que se quiso entender. -->
+
+-
+"""
+
+CUERPO_DOC = """---
+ticket: {slug}
+repo: {repo}
+estado: propuesto
+---
+
+# {slug} ({repo})
+
+## Estado actual
+
+<!-- Presente, sin fechas, maximo {cota_estado} lineas. Una fecha aca es un
+     error detectable con grep: significa que se filtro un delta. Lo que
+     cambio va al historial. -->
+
+Nada ejecutado todavia.
+
+## Archivos tocados
+
+<!-- Separados a proposito: tocar un archivo preexistente tiene un costo de
+     revision distinto que crear uno nuevo. -->
+
+**Nuevos:**
+
+**Preexistentes:**
+
+## Decisiones
+
+<!-- Stubs de una linea. `close` los extrae. -->
+
+-
+"""
+
+
+def crear_doc(repo: str, slug: str) -> Path:
+    p = ruta_doc(repo, slug)
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            CUERPO_DOC.format(slug=slug, repo=repo, cota_estado=COTA_ESTADO_ACTUAL),
+            encoding="utf-8", newline="\n",
+        )
+    return p
+
+
+def regenerar_indice() -> Path:
+    """INDICE.md se CONSULTA, no se lee al abrir sesion: una linea por ticket."""
+    ts = tickets_todos()
+    lineas = [
+        "# Indice de tickets",
+        "",
+        "Generado por `factoria board`. No se edita a mano, y no se carga al abrir",
+        "una sesion: para eso esta `factoria contexto <slug>`.",
+        "",
+        "| slug | fase | repos | sesiones |",
+        "|---|---|---|---|",
+    ]
+    for t in sorted(ts, key=lambda x: (not x.abierto, x.slug)):
+        repos = ", ".join(e.repo for e in t.repos) or "-"
+        ses = sum(1 for e in t.repos if e.session_id)
+        lineas.append(f"| [{t.slug}](tickets/{t.slug}.md) | {t.fase} | {repos} | {ses} |")
+    lineas.append("")
+    p = DATOS / "INDICE.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lineas), encoding="utf-8", newline="\n")
+    return p
+
+
+# --------------------------------------------------------------------------
+# Comandos de tickets
+# --------------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("slug")
+@click.option("--repo", required=True, help="Repo donde arranca el trabajo.")
+@click.option("--cuenta", type=click.Choice(list(CUENTAS)),
+              help="Override del perfil del repo.")
+@click.option("--pedido", help="El pedido crudo, literal. Sin esto se abre el editor.")
+@click.option("--no-lanzar", is_flag=True, help="Crear el ticket sin abrir la sesion.")
+@click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
+def new(slug: str, repo: str, cuenta: str | None, pedido: str | None,
+        no_lanzar: bool, forzar: bool) -> None:
+    """Crea un ticket en fase plan y abre su sesion, con id conocido de antemano."""
+    if not RE_SLUG.match(slug):
+        raise click.ClickException(
+            f"slug invalido: '{slug}'. Minusculas, numeros y guiones: `matriz-pendientes`."
+        )
+    destino = dir_tickets() / f"{slug}.md"
+    if destino.exists():
+        raise click.ClickException(
+            f"ya existe {destino}.\nSi querias sumarle un repo, eso es `factoria open` "
+            "(paso 9); si querias reanudarlo, `factoria resume {slug}`."
+        )
+    rp = ruta_repo(repo)
+    if not rp:
+        raise click.ClickException(
+            f"no encuentro el repo '{repo}'. Hay: "
+            + ", ".join(r.name for r in descubrir_repos())
+        )
+    pf = perfil(rp.name)
+    cta = cuenta or pf.get("cuenta") or "dfv"
+    if cta not in CUENTAS:
+        raise click.ClickException(f"cuenta '{cta}' desconocida (perfil de {rp.name}).")
+
+    if not pedido:
+        pedido = (click.edit(
+            "\n\n<!-- El pedido como te llego: verbal, WhatsApp, lo que sea. LITERAL,\n"
+            "     sin interpretar ni ordenar. Esta seccion no se edita nunca mas:\n"
+            "     es contra lo que se compara si despues hubo malentendido. -->\n"
+        ) or "")
+        pedido = "\n".join(l for l in pedido.splitlines()
+                           if not l.strip().startswith(("<!--", "-->"))
+                           and "El pedido como te llego" not in l
+                           and "sin interpretar" not in l
+                           and "es contra lo que se compara" not in l).strip()
+    if not pedido.strip():
+        raise click.ClickException("el pedido crudo quedo vacio: sin eso el ticket no sirve.")
+
+    sid = str(uuid.uuid4())
+    rama = git(rp, "rev-parse", "--abbrev-ref", "HEAD") or ""
+    doc = crear_doc(rp.name, slug)
+    t = Ticket(
+        slug=slug, fase="plan", abierto=True, spec_congelado="",
+        repos=[RepoTicket(repo=rp.name, cuenta=cta, rama=rama, cwd=str(rp),
+                          session_id=sid, doc=str(doc))],
+        cuerpo=CUERPO_TICKET.format(slug=slug, pedido=pedido.strip()),
+        path=destino,
+    )
+    escribir_ticket(t)
+    regenerar_indice()
+
+    console.print()
+    console.print(f"[bold]{slug}[/]  fase plan  |  {rp.name}  |  cuenta {cta}")
+    console.print(f"  ticket   {destino}")
+    console.print(f"  doc      {doc}")
+    console.print(f"  sesion   {sid}")
+    console.print(f"  rama     {rama or '(sin rama)'}")
+    console.print()
+    console.print("[dim]En la sesion: escribí los criterios de aceptación y, sobre todo, "
+                  "los supuestos abiertos.\nEsa seccion vacía en fase plan significa que "
+                  "no se entendió el pedido.[/]")
+    console.print()
+    if no_lanzar:
+        console.print(f"[dim]Para abrirla: factoria resume {slug}[/]")
+        return
+    _lanzar_en(cta, str(rp), ["--session-id", sid], forzar, False, rama)
+
+
+@cli.command("fase")
+@click.argument("slug")
+@click.argument("nueva", type=click.Choice(FASES))
+def fase_cmd(slug: str, nueva: str) -> None:
+    """Cambia la fase de un ticket. NO corta la sesion: eso es `cortar`."""
+    t = buscar_ticket(slug)
+    previa = t.fase
+    if previa == nueva:
+        console.print(f"[dim]{t.slug} ya esta en fase {nueva}.[/]")
+        return
+    t.fase = nueva
+    if nueva == "cerrado":
+        t.abierto = False
+    escribir_ticket(t)
+    regenerar_indice()
+    console.print(f"[bold]{t.slug}[/]  {previa} -> {nueva}")
+    console.print(
+        "[dim]La sesion sigue viva: cambiar de fase no la corta, porque reconstruir "
+        "contexto cuesta mas que seguir.\n"
+        f"Cortá cuando pese, no cuando cambie la fase: factoria sesiones --repo "
+        f"{t.repos[0].repo if t.repos else ''}[/]"
+    )
+
+
+@cli.command()
+@click.option("--todos", is_flag=True, help="Incluir los cerrados.")
+@click.option("--json", "como_json", is_flag=True, help="Volcado crudo.")
+def tickets(todos: bool, como_json: bool) -> None:
+    """Lista los tickets con su fase, repos y sesiones asociadas."""
+    ts = tickets_todos()
+    if not todos:
+        ts = [t for t in ts if t.abierto]
+    if como_json:
+        click.echo(json.dumps(
+            [{"slug": t.slug, "fase": t.fase, "abierto": t.abierto,
+              "spec_congelado": t.spec_congelado, "lineas": t.lineas,
+              "repos": [dict(vars(e)) for e in t.repos]} for t in ts],
+            indent=2, ensure_ascii=False))
+        return
+    if not ts:
+        console.print()
+        console.print("[dim]No hay tickets todavia. `factoria new <slug> --repo R`[/]")
+        console.print()
+        return
+    console.print()
+    console.print(f"[bold]Tickets[/]  |  {len(ts)}"
+                  + ("" if todos else f" abiertos de {len(tickets_todos())}"))
+    t_ = Table(title_justify="left", header_style="bold")
+    t_.add_column("slug", overflow="fold")
+    t_.add_column("fase")
+    t_.add_column("repo")
+    t_.add_column("cuenta")
+    t_.add_column("rama", max_width=26, overflow="fold")
+    t_.add_column("ses")
+    t_.add_column("lin", justify="right")
+    for t in ts:
+        if not t.repos:
+            t_.add_row(t.slug, t.fase, "[red]-[/]", "-", "-", "-", str(t.lineas))
+        for i, e in enumerate(t.repos):
+            t_.add_row(t.slug if i == 0 else "", t.fase if i == 0 else "",
+                       e.repo, e.cuenta, e.rama or "-",
+                       "si" if e.session_id else "[red]NO[/]",
+                       str(t.lineas) if i == 0 else "")
+    console.print(t_)
+    console.print()
+
+
+@cli.command("perfiles")
+@click.option("--sobrescribir", is_flag=True, help="Regenerar los que ya existen.")
+def perfiles_cmd(sobrescribir: bool) -> None:
+    """Genera un perfil por repo, detectando donde van sus docs de trabajo."""
+    escritos = sembrar_perfiles(sobrescribir)
+    d = DATOS / "profiles"
+    console.print()
+    if escritos:
+        console.print(f"[bold]Escritos[/] en {d}: " + ", ".join(escritos))
+    else:
+        console.print(f"[dim]Ya existian todos en {d} (--sobrescribir para regenerar).[/]")
+    for p in sorted(d.glob("*.yml")):
+        pf = perfil(p.stem)
+        console.print(f"  {p.stem:<22} cuenta={pf.get('cuenta'):<9} "
+                      f"docs={pf.get('docs'):<10} -> {ruta_doc(p.stem, '<slug>')}")
+    console.print()
 
 
 if __name__ == "__main__":
