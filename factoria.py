@@ -639,6 +639,13 @@ def hallazgos(rel: Relevamiento) -> list[str]:
             ".jsonl en disco (nunca abiertas, o borradas): "
             + ", ".join(f"{t.slug}/{e.repo}" for t, e in huerfanas[:3])
         )
+    sin_espejo = [t for t in rel.tickets if t.abierto and not t.issue]
+    if sin_espejo and (DATOS / "github.yml").is_file():
+        h.append(
+            f"[yellow]espejo[/] {len(sin_espejo)} tickets abiertos sin issue: "
+            + ", ".join(t.slug for t in sin_espejo[:3])
+            + "  ->  factoria espejo --todos"
+        )
     en_plan = [t for t in rel.tickets if t.abierto and t.fase == "plan"
                and "## Supuestos abiertos" in t.cuerpo
                and not _tiene_items(t.cuerpo, "## Supuestos abiertos")]
@@ -1094,6 +1101,9 @@ class Ticket:
     fase: str = "plan"
     abierto: bool = True
     spec_congelado: str = ""
+    issue: int = 0
+    issue_url: str = ""
+    proyecto_item: str = ""
     repos: list[RepoTicket] = field(default_factory=list)
     cuerpo: str = ""
     path: Path | None = None
@@ -1108,6 +1118,9 @@ class Ticket:
             "fase": self.fase,
             "abierto": self.abierto,
             "spec_congelado": self.spec_congelado,
+            "issue": self.issue,
+            "issue_url": self.issue_url,
+            "proyecto_item": self.proyecto_item,
             "repos": [dict(vars(e)) for e in self.repos],
         }
         y = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True,
@@ -1147,6 +1160,9 @@ def leer_ticket(p: Path) -> Ticket | None:
         fase=str(fm.get("fase") or "plan"),
         abierto=bool(fm.get("abierto", True)),
         spec_congelado=str(fm.get("spec_congelado") or ""),
+        issue=int(fm.get("issue") or 0),
+        issue_url=str(fm.get("issue_url") or ""),
+        proyecto_item=str(fm.get("proyecto_item") or ""),
         repos=repos,
         cuerpo=txt[m.end():],
         path=p,
@@ -1387,13 +1403,16 @@ def regenerar_indice() -> Path:
         "Generado por `factoria board`. No se edita a mano, y no se carga al abrir",
         "una sesion: para eso esta `factoria contexto <slug>`.",
         "",
-        "| slug | fase | repos | sesiones |",
-        "|---|---|---|---|",
+        "| slug | fase | repos | sesiones | issue |",
+        "|---|---|---|---|---|",
     ]
     for t in sorted(ts, key=lambda x: (not x.abierto, x.slug)):
         repos = ", ".join(e.repo for e in t.repos) or "-"
         ses = sum(1 for e in t.repos if e.session_id)
-        lineas.append(f"| [{t.slug}](tickets/{t.slug}.md) | {t.fase} | {repos} | {ses} |")
+        iss = f"[#{t.issue}]({t.issue_url})" if t.issue_url else "-"
+        lineas.append(
+            f"| [{t.slug}](tickets/{t.slug}.md) | {t.fase} | {repos} | {ses} | {iss} |"
+        )
     lineas.append("")
     p = DATOS / "INDICE.md"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1406,42 +1425,56 @@ def regenerar_indice() -> Path:
 # --------------------------------------------------------------------------
 
 
-def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None) -> str:
-    """Que rama registra el ticket, creandola si hace falta.
+# feature/ (51 ramas) y fix/ (41) son tu convencion real en defeve; chore/ (7)
+# la sigue. El default es feature porque es el caso mayoritario.
+TIPOS_RAMA = ("feature", "fix", "chore")
 
-    Sin --rama se usa la rama actual del repo, y ahi esta el pozo: si el repo
-    quedo parado en una feature ajena, el ticket nuevo la registra como si fuera
-    la suya y los commits caen en la rama de otra tarea. Por eso se avisa.
-    """
-    if not pedida:
-        if actual and base and actual != base:
-            console.print(
-                f"[yellow]Ojo:[/] el ticket va a quedar registrado en "
-                f"[bold]{actual}[/], que no es la base ({base}).\n"
-                f"[dim]Si esta tarea es nueva, cancelá y corré con "
-                f"--rama <nombre> para crearla desde {base}.[/]\n"
-            )
-        return actual
-    existe = git(rp, "rev-parse", "--verify", "--quiet", f"refs/heads/{pedida}")
-    sucio = git(rp, "status", "--porcelain")
-    if sucio:
-        raise click.ClickException(
-            f"{rp.name} tiene cambios sin commitear: cambiar de rama ahora los "
-            f"arrastraria a '{pedida}'. Resolvelos y volvé a correr.\n" + sucio[:400]
-        )
-    if existe:
-        r = subprocess.run(["git", "-C", str(rp), "checkout", pedida],
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace")
-        console.print(f"[dim]checkout de la rama existente {pedida}[/]")
-    else:
-        r = subprocess.run(["git", "-C", str(rp), "checkout", "-b", pedida, base],
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace")
-        console.print(f"[dim]rama nueva {pedida} desde {base}[/]")
+
+def existe_rama(rp: Path, nombre: str) -> bool:
+    return bool(git(rp, "rev-parse", "--verify", "--quiet", f"refs/heads/{nombre}"))
+
+
+def _git_o_falla(rp: Path, *args: str) -> None:
+    r = subprocess.run(["git", "-C", str(rp), *args], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
-        raise click.ClickException(f"git checkout falló:\n{(r.stderr or '').strip()[:400]}")
-    return git(rp, "rev-parse", "--abbrev-ref", "HEAD") or pedida
+        raise click.ClickException(
+            f"git {' '.join(args)} falló:\n{(r.stderr or r.stdout or '').strip()[:400]}"
+        )
+
+
+def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None,
+                   slug: str, tipo: str, aqui: bool) -> str:
+    """La rama del ticket. Por defecto SIEMPRE una nueva, derivada del slug.
+
+    Usar la rama actual era el pozo: si el repo quedo parado en la feature de
+    otra tarea, el ticket nuevo la adoptaba y los commits de la sesion caian en
+    la rama equivocada. Con --aqui se puede pedir explicitamente lo contrario.
+    """
+    if aqui:
+        console.print(f"[dim]--aqui: se registra la rama actual, {actual or '(ninguna)'}[/]")
+        return actual
+    destino = pedida or f"{tipo}/{slug}"
+    if actual == destino:
+        return actual
+    if sucio := git(rp, "status", "--porcelain"):
+        raise click.ClickException(
+            f"{rp.name} tiene cambios sin commitear: el checkout a '{destino}' los "
+            f"arrastraria ahi.\nCommiteálos, guardálos con `git stash`, o usá --aqui "
+            f"para quedarte en {actual}.\n\n" + sucio[:400]
+        )
+    if existe_rama(rp, destino):
+        _git_o_falla(rp, "checkout", destino)
+        console.print(f"[dim]checkout de la rama existente {destino}[/]")
+    else:
+        if not base:
+            raise click.ClickException(
+                f"no puedo determinar la base de {rp.name} para crear '{destino}'. "
+                "Seteá `base:` en su perfil."
+            )
+        _git_o_falla(rp, "checkout", "-b", destino, base)
+        console.print(f"[dim]rama nueva {destino} desde {base}[/]")
+    return git(rp, "rev-parse", "--abbrev-ref", "HEAD") or destino
 
 
 @cli.command()
@@ -1450,12 +1483,17 @@ def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None) -> str:
 @click.option("--cuenta", type=click.Choice(list(CUENTAS)),
               help="Override del perfil del repo.")
 @click.option("--pedido", help="El pedido crudo, literal. Sin esto se abre el editor.")
-@click.option("--rama", "rama_pedida", help="Rama del trabajo. La crea desde la base si "
-                                            "no existe. Sin esto se usa la rama actual.")
+@click.option("--rama", "rama_pedida",
+              help="Nombre completo de la rama. Por defecto <tipo>/<slug>.")
+@click.option("--tipo", type=click.Choice(TIPOS_RAMA), default="feature",
+              show_default=True, help="Prefijo de la rama.")
+@click.option("--aqui", is_flag=True,
+              help="No crear rama: registrar la actual. Escape hatch explicito.")
 @click.option("--no-lanzar", is_flag=True, help="Crear el ticket sin abrir la sesion.")
 @click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
 def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
-        rama_pedida: str | None, no_lanzar: bool, forzar: bool) -> None:
+        rama_pedida: str | None, tipo: str, aqui: bool, no_lanzar: bool,
+        forzar: bool) -> None:
     """Crea un ticket en fase plan y abre su sesion, con id conocido de antemano."""
     crudo, slug = slug, normalizar_slug(slug)
     if not slug:
@@ -1499,7 +1537,7 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     sid = str(uuid.uuid4())
     base = perfil(rp.name).get("base") or base_de(rp) or ""
     actual = git(rp, "rev-parse", "--abbrev-ref", "HEAD") or ""
-    rama = _resolver_rama(rp, base, actual, rama_pedida)
+    rama = _resolver_rama(rp, base, actual, rama_pedida, slug, tipo, aqui)
     doc = crear_doc(rp.name, slug)
     t = Ticket(
         slug=slug, fase="plan", abierto=True, spec_congelado="",
@@ -1544,6 +1582,13 @@ def fase_cmd(slug: str, nueva: str) -> None:
     escribir_ticket(t)
     regenerar_indice()
     console.print(f"[bold]{t.slug}[/]  {previa} -> {nueva}")
+    # El espejo es opcional por diseño: si falla, el ticket ya quedo bien.
+    if t.proyecto_item:
+        try:
+            for h in espejar(t, config_github()):
+                console.print(f"  {h}")
+        except click.ClickException as exc:
+            console.print(f"  [yellow]espejo pendiente:[/] {exc.message}")
     console.print(
         "[dim]La sesion sigue viva: cambiar de fase no la corta, porque reconstruir "
         "contexto cuesta mas que seguir.\n"
@@ -1582,17 +1627,322 @@ def tickets(todos: bool, como_json: bool) -> None:
     t_.add_column("cuenta")
     t_.add_column("rama", max_width=26, overflow="fold")
     t_.add_column("ses")
+    t_.add_column("issue")
     t_.add_column("lin", justify="right")
     for t in ts:
         if not t.repos:
-            t_.add_row(t.slug, t.fase, "[red]-[/]", "-", "-", "-", str(t.lineas))
+            t_.add_row(t.slug, t.fase, "[red]-[/]", "-", "-", "-",
+                       f"#{t.issue}" if t.issue else "-", str(t.lineas))
         for i, e in enumerate(t.repos):
             t_.add_row(t.slug if i == 0 else "", t.fase if i == 0 else "",
                        e.repo, e.cuenta, e.rama or "-",
                        "si" if e.session_id else "[red]NO[/]",
+                       (f"#{t.issue}" if t.issue else "[dim]-[/]") if i == 0 else "",
                        str(t.lineas) if i == 0 else "")
     console.print(t_)
     console.print()
+
+
+# --------------------------------------------------------------------------
+# Espejo a GitHub Issues + Project v2 (paso 5). Una sola via: los .md son
+# canonicos. Si esto falla, el ticket sigue existiendo igual.
+# --------------------------------------------------------------------------
+
+GH_FALLBACK = Path(r"C:\Program Files\GitHub CLI\gh.exe")
+
+
+def bin_gh() -> str | None:
+    return shutil.which("gh") or (str(GH_FALLBACK) if GH_FALLBACK.is_file() else None)
+
+
+def gh(*args: str) -> tuple[int, str, str]:
+    b = bin_gh()
+    if not b:
+        return 127, "", "no encuentro `gh` en el PATH"
+    r = subprocess.run([b, *args], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=60)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def config_github() -> dict:
+    p = DATOS / "github.yml"
+    if not p.is_file():
+        return {}
+    try:
+        d = yaml.safe_load(p.read_text(encoding="utf-8", errors="replace"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+def _seccion(cuerpo: str, encabezado: str) -> str:
+    """El texto de una seccion, sin los comentarios HTML de la plantilla."""
+    lineas, out, dentro, com = cuerpo.splitlines(), [], False, False
+    for l in lineas:
+        if l.startswith("## "):
+            dentro = l.strip() == encabezado
+            continue
+        if not dentro:
+            continue
+        if "<!--" in l:
+            com = True
+        if com:
+            if "-->" in l:
+                com = False
+            continue
+        out.append(l)
+    return "\n".join(out).strip()
+
+
+def cuerpo_issue(t: Ticket) -> str:
+    """El issue es un espejo legible, no la fuente de verdad. Eso se dice arriba."""
+    partes = [
+        "> Espejo de un ticket de factoria. **La fuente de verdad es el archivo**, "
+        f"no este issue: `.factoria/tickets/{t.slug}.md`.",
+        "",
+        f"**fase:** `{t.fase}`",
+        "",
+        "**repos**",
+        "",
+    ]
+    for e in t.repos:
+        partes.append(f"- `{e.repo}` ({e.cuenta}) — rama `{e.rama or '?'}`")
+    for enc in ("## Pedido crudo", "## Criterios de aceptación",
+                "## Fuera de alcance", "## Supuestos abiertos"):
+        cuerpo = _seccion(t.cuerpo, enc)
+        partes += ["", enc.replace("## ", "### "), "", cuerpo or "_(vacío)_"]
+    return "\n".join(partes)
+
+
+def espejar(t: Ticket, cfg: dict) -> list[str]:
+    """Sincroniza ticket -> issue -> item del Project. Devuelve que hizo."""
+    faltan = [k for k in ("repo", "proyecto", "campo_fase") if k not in cfg]
+    if faltan:
+        raise click.ClickException(
+            f"falta {', '.join(faltan)} en {DATOS / 'github.yml'}. "
+            "Corré `factoria espejo --probar` para ver el diagnostico."
+        )
+    repo = cfg["repo"]
+    pr, campo = cfg["proyecto"], cfg["campo_fase"]
+    hechos = []
+
+    if not t.issue:
+        rc, out, err = gh("issue", "create", "--repo", repo,
+                          "--title", t.slug, "--body", cuerpo_issue(t))
+        if rc != 0:
+            raise click.ClickException(f"gh issue create falló:\n{err[:400]}")
+        t.issue_url = out.splitlines()[-1].strip()
+        t.issue = int(t.issue_url.rstrip("/").rsplit("/", 1)[-1] or 0)
+        hechos.append(f"issue #{t.issue} creado")
+    else:
+        rc, _, err = gh("issue", "edit", str(t.issue), "--repo", repo,
+                        "--body", cuerpo_issue(t))
+        hechos.append(f"issue #{t.issue} actualizado" if rc == 0
+                      else f"[yellow]no pude actualizar el issue: {err[:120]}[/]")
+
+    if not t.proyecto_item:
+        rc, out, err = gh("project", "item-add", str(pr["numero"]),
+                          "--owner", pr["owner"], "--url", t.issue_url,
+                          "--format", "json")
+        if rc != 0:
+            raise click.ClickException(f"gh project item-add falló:\n{err[:400]}")
+        try:
+            t.proyecto_item = json.loads(out)["id"]
+        except (ValueError, KeyError):
+            raise click.ClickException(f"no pude leer el id del item:\n{out[:200]}")
+        hechos.append("agregado al tablero")
+
+    opcion = (campo.get("opciones") or {}).get(t.fase)
+    if opcion:
+        rc, _, err = gh("project", "item-edit", "--id", t.proyecto_item,
+                        "--project-id", pr["id"], "--field-id", campo["id"],
+                        "--single-select-option-id", str(opcion))
+        hechos.append(f"fase = {t.fase}" if rc == 0
+                      else f"[yellow]no pude mover la tarjeta: {err[:120]}[/]")
+
+    if not t.abierto:
+        rc, _, _ = gh("issue", "close", str(t.issue), "--repo", repo)
+        if rc == 0:
+            hechos.append("issue cerrado")
+    return hechos
+
+
+@cli.command("espejo")
+@click.argument("slug", required=False)
+@click.option("--probar", is_flag=True, help="Diagnostico: no escribe nada.")
+@click.option("--todos", is_flag=True, help="Espejar todos los tickets abiertos.")
+def espejo_cmd(slug: str | None, probar: bool, todos: bool) -> None:
+    """Espeja un ticket como issue de GitHub y tarjeta del Project."""
+    cfg = config_github()
+    if probar:
+        console.print()
+        console.print(f"[bold]espejo --probar[/]  |  config {DATOS / 'github.yml'}")
+        console.print(f"  gh          {bin_gh() or '[red]NO ENCONTRADO[/]'}")
+        rc, out, _ = gh("auth", "status")
+        scopes = next((l.strip() for l in out.splitlines() if "scopes" in l.lower()), "?")
+        console.print(f"  auth        {'ok' if rc == 0 else '[red]sin login[/]'}  {scopes}")
+        console.print(f"  repo        {cfg.get('repo', '[red]falta[/]')}")
+        pr = cfg.get("proyecto") or {}
+        console.print(f"  proyecto    #{pr.get('numero', '?')} {pr.get('url', '')}")
+        campo = cfg.get("campo_fase") or {}
+        console.print(f"  campo fase  {campo.get('id', '[red]falta[/]')}  "
+                      f"opciones: {', '.join(campo.get('opciones') or {}) or '[red]ninguna[/]'}")
+        if pr.get("numero"):
+            rc, out, err = gh("project", "field-list", str(pr["numero"]),
+                              "--owner", pr.get("owner", ""), "--format", "json")
+            console.print(f"  lectura     {'ok' if rc == 0 else '[red]' + err[:90] + '[/]'}")
+        console.print()
+        return
+
+    objetivo = [t for t in tickets_todos() if t.abierto] if todos else \
+               ([buscar_ticket(slug)] if slug else [])
+    if not objetivo:
+        raise click.ClickException("pasá un slug, o --todos, o --probar.")
+    for t in objetivo:
+        hechos = espejar(t, cfg)
+        escribir_ticket(t)
+        console.print(f"[bold]{t.slug}[/]  {t.issue_url}")
+        for h in hechos:
+            console.print(f"  {h}")
+    regenerar_indice()
+
+
+@cli.command("abrir")
+@click.argument("slug")
+def abrir_cmd(slug: str) -> None:
+    """Abre el issue del ticket en el navegador (o imprime la URL)."""
+    t = buscar_ticket(slug)
+    if not t.issue_url:
+        raise click.ClickException(
+            f"'{t.slug}' no tiene issue todavia. `factoria espejo {t.slug}` lo crea."
+        )
+    console.print(t.issue_url)
+    try:
+        os.startfile(t.issue_url)  # type: ignore[attr-defined]
+    except (AttributeError, OSError) as exc:
+        console.print(f"[dim]no pude abrir el navegador ({exc}); la URL esta arriba.[/]")
+
+
+def _entrada_unica(t: Ticket, repo: str | None) -> RepoTicket:
+    entradas = [e for e in t.repos if not repo or repo.lower() in e.repo.lower()]
+    if not entradas:
+        raise click.ClickException(
+            f"'{t.slug}' no tiene entrada para --repo {repo}. Repos: "
+            + ", ".join(e.repo for e in t.repos)
+        )
+    if len(entradas) > 1:
+        raise click.ClickException(
+            f"'{t.slug}' tiene {len(entradas)} repos, elegí uno con --repo: "
+            + ", ".join(e.repo for e in entradas)
+        )
+    return entradas[0]
+
+
+def _renombrar_rama(rp: Path, vieja: str, nueva: str) -> None:
+    """Renombra la rama en git, o la crea si la vieja no existe."""
+    if existe_rama(rp, nueva):
+        raise click.ClickException(f"{rp.name} ya tiene una rama '{nueva}'.")
+    if existe_rama(rp, vieja):
+        # `git branch -m` funciona incluso con la rama activa. Lo que NO mueve es
+        # el remoto: si ya se pusheo, alla queda el nombre viejo.
+        up = git(rp, "for-each-ref", "--format=%(upstream:short)", f"refs/heads/{vieja}")
+        _git_o_falla(rp, "branch", "-m", vieja, nueva)
+        if up:
+            console.print(
+                f"[yellow]Ojo:[/] '{vieja}' tenia upstream [bold]{up}[/]. El remoto "
+                f"sigue con el nombre viejo; el proximo push necesita "
+                f"`git push -u origin {nueva}` y conviene borrar la vieja alla."
+            )
+    else:
+        console.print(f"[dim]{rp.name} no tiene la rama '{vieja}'; solo se "
+                      "actualiza el registro del ticket.[/]")
+
+
+@cli.command("rama")
+@click.argument("slug")
+@click.argument("nueva")
+@click.option("--repo", help="Cuando el ticket tiene varios repos.")
+def rama_cmd(slug: str, nueva: str, repo: str | None) -> None:
+    """Renombra la rama de un ticket, en git y en el registro."""
+    t = buscar_ticket(slug)
+    e = _entrada_unica(t, repo)
+    if e.rama == nueva:
+        console.print(f"[dim]{t.slug}/{e.repo} ya esta en '{nueva}'.[/]")
+        return
+    rp = ruta_repo(e.repo)
+    if not rp:
+        raise click.ClickException(f"no encuentro el repo '{e.repo}' en disco.")
+    vieja = e.rama
+    _renombrar_rama(rp, vieja, nueva)
+    e.rama = nueva
+    escribir_ticket(t)
+    regenerar_indice()
+    console.print(f"[bold]{t.slug}[/] / {e.repo}:  {vieja or '(sin rama)'} -> {nueva}")
+
+
+@cli.command("renombrar")
+@click.argument("slug")
+@click.argument("nuevo")
+@click.option("--con-rama/--sin-rama", default=True, show_default=True,
+              help="Renombrar tambien las ramas que contengan el slug viejo.")
+def renombrar_cmd(slug: str, nuevo: str, con_rama: bool) -> None:
+    """Renombra un ticket: el archivo, sus docs, y las ramas derivadas del slug."""
+    t = buscar_ticket(slug)
+    viejo = t.slug
+    nuevo = normalizar_slug(nuevo)
+    if not nuevo:
+        raise click.ClickException("el nombre nuevo no deja nada usable como slug.")
+    if nuevo == viejo:
+        console.print(f"[dim]ya se llama '{nuevo}'.[/]")
+        return
+    destino = dir_tickets() / f"{nuevo}.md"
+    if destino.exists():
+        raise click.ClickException(f"ya existe un ticket '{nuevo}'.")
+
+    hechos: list[str] = []
+    for e in t.repos:
+        # Ramas primero: si git falla, no quiero archivos ya movidos.
+        if con_rama and e.rama and viejo in e.rama:
+            rp = ruta_repo(e.repo)
+            if rp:
+                rama_nueva = e.rama.replace(viejo, nuevo)
+                _renombrar_rama(rp, e.rama, rama_nueva)
+                hechos.append(f"rama {e.rama} -> {rama_nueva}")
+                e.rama = rama_nueva
+    for e in t.repos:
+        if not e.doc:
+            continue
+        viejo_doc = Path(e.doc)
+        nuevo_doc = ruta_doc(e.repo, nuevo)
+        if viejo_doc.is_file() and viejo_doc != nuevo_doc:
+            nuevo_doc.parent.mkdir(parents=True, exist_ok=True)
+            txt = viejo_doc.read_text(encoding="utf-8", errors="replace")
+            nuevo_doc.write_text(
+                re.sub(rf"^ticket:\s*{re.escape(viejo)}\s*$", f"ticket: {nuevo}",
+                       txt, count=1, flags=re.M),
+                encoding="utf-8", newline="\n",
+            )
+            viejo_doc.unlink()
+            hechos.append(f"doc {viejo_doc.name} -> {nuevo_doc.name}")
+        e.doc = str(nuevo_doc)
+
+    viejo_path = t.path
+    t.slug = nuevo
+    t.path = destino
+    # El titulo `# <slug>` del cuerpo tambien, si estaba.
+    t.cuerpo = re.sub(rf"^#\s+{re.escape(viejo)}\s*$", f"# {nuevo}",
+                      t.cuerpo, count=1, flags=re.M)
+    escribir_ticket(t)
+    if viejo_path and viejo_path.is_file() and viejo_path != destino:
+        viejo_path.unlink()
+        hechos.append(f"ticket {viejo_path.name} -> {destino.name}")
+    regenerar_indice()
+
+    console.print(f"[bold]{viejo}[/] -> [bold]{nuevo}[/]")
+    for h in hechos:
+        console.print(f"  {h}")
+    console.print("[dim]La sesion no cambia: el session_id sigue siendo el mismo, "
+                  f"asi que `factoria resume {nuevo}` cae en la misma conversacion.[/]")
 
 
 @cli.command("perfiles")
