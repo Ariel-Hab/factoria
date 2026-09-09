@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1197,6 +1198,34 @@ def buscar_ticket(slug: str) -> Ticket:
 PERFIL_DEFECTO = {"cuenta": "dfv", "docs": "central"}
 
 
+def normalizar_slug(bruto: str) -> str:
+    """`rediseño web` -> `rediseno-web`.
+
+    El slug termina siendo nombre de archivo, componente de rama, label de
+    GitHub y clave del grafo. Rechazar la ñ seria correcto y molesto: se
+    normaliza y se avisa. NFKD descompone la ñ en n + tilde combinante, y
+    despues se descartan las marcas.
+    """
+    s = unicodedata.normalize("NFKD", bruto)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-").lower()
+
+
+def repo_del_cwd() -> Path | None:
+    """El repo descubierto que contiene el directorio actual, si hay uno."""
+    try:
+        aqui = Path.cwd().resolve()
+    except OSError:
+        return None
+    for r in descubrir_repos():
+        try:
+            aqui.relative_to(r.resolve())
+        except (ValueError, OSError):
+            continue
+        return r
+    return None
+
+
 def ruta_repo(nombre: str) -> Path | None:
     n = nombre.lower()
     repos = descubrir_repos()
@@ -1379,30 +1408,34 @@ def regenerar_indice() -> Path:
 
 @cli.command()
 @click.argument("slug")
-@click.option("--repo", required=True, help="Repo donde arranca el trabajo.")
+@click.option("--repo", help="Repo donde arranca. Por defecto, el del directorio actual.")
 @click.option("--cuenta", type=click.Choice(list(CUENTAS)),
               help="Override del perfil del repo.")
 @click.option("--pedido", help="El pedido crudo, literal. Sin esto se abre el editor.")
 @click.option("--no-lanzar", is_flag=True, help="Crear el ticket sin abrir la sesion.")
 @click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
-def new(slug: str, repo: str, cuenta: str | None, pedido: str | None,
+def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
         no_lanzar: bool, forzar: bool) -> None:
     """Crea un ticket en fase plan y abre su sesion, con id conocido de antemano."""
+    crudo, slug = slug, normalizar_slug(slug)
+    if not slug:
+        raise click.ClickException(f"'{crudo}' no deja nada usable como slug.")
+    if slug != crudo:
+        console.print(f"[dim]slug normalizado: '{crudo}' -> '{slug}'[/]")
     if not RE_SLUG.match(slug):
-        raise click.ClickException(
-            f"slug invalido: '{slug}'. Minusculas, numeros y guiones: `matriz-pendientes`."
-        )
+        raise click.ClickException(f"slug invalido despues de normalizar: '{slug}'.")
     destino = dir_tickets() / f"{slug}.md"
     if destino.exists():
         raise click.ClickException(
             f"ya existe {destino}.\nSi querias sumarle un repo, eso es `factoria open` "
-            "(paso 9); si querias reanudarlo, `factoria resume {slug}`."
+            f"(paso 9); si querias reanudarlo, `factoria resume {slug}`."
         )
-    rp = ruta_repo(repo)
+    rp = ruta_repo(repo) if repo else repo_del_cwd()
     if not rp:
+        detalle = (f"no encuentro el repo '{repo}'" if repo else
+                   "no estas dentro de un repo conocido, asi que hace falta --repo")
         raise click.ClickException(
-            f"no encuentro el repo '{repo}'. Hay: "
-            + ", ".join(r.name for r in descubrir_repos())
+            detalle + ". Hay: " + ", ".join(r.name for r in descubrir_repos())
         )
     pf = perfil(rp.name)
     cta = cuenta or pf.get("cuenta") or "dfv"
