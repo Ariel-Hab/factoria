@@ -1,15 +1,23 @@
 #!/usr/bin/env python
 """factoria - gestor de tickets, sesiones y documentacion.
 
-Paso 1: `board` (solo lectura). No escribe nada: releva el estado real del
-ecosistema a partir de los artefactos que ya existen (branches, worktrees,
-docs de trabajo, sesiones, contratos) y reporta las cotas violadas.
+`board` (solo lectura) releva el estado real del ecosistema a partir de los
+artefactos que ya existen (branches, worktrees, docs de trabajo, sesiones,
+contratos) y reporta las cotas violadas.
+
+`sesiones` / `resume` / `cortar` (paso 3) indexan las sesiones de los dos
+config dirs y reanudan la correcta, con su cuenta y su cwd. El indice es
+derivado: se reconstruye leyendo los .jsonl en cada corrida, asi que no hay
+estado que se pueda desincronizar.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +49,13 @@ COTA_DOC_TRABAJO = 200
 UMBRAL_SESION_MB = 1.0
 # Una sesion que no se toca en mas de esto ya no se va a reanudar: no es hallazgo.
 DIAS_SESION_VIVA = 7
+
+# Los titulos de sesion vienen del .jsonl con acentos y la consola de Windows no
+# siempre esta en UTF-8: sin esto salen como '?'.
+# stderr tambien: los mensajes de error de click salen por ahi y no por rich.
+for _flujo in (sys.stdout, sys.stderr):
+    if hasattr(_flujo, "reconfigure"):
+        _flujo.reconfigure(encoding="utf-8", errors="replace")
 
 console = Console()
 
@@ -293,6 +308,73 @@ class Sesion:
     session_id: str
     mb: float
     dias: int
+    cwd: str = ""
+    rama: str = ""
+    rama_inicial: str = ""
+    titulo: str = ""
+    mtime: float = 0.0
+
+    @property
+    def repo(self) -> str:
+        return Path(self.cwd).name if self.cwd else self.proyecto
+
+    @property
+    def cambio_de_rama(self) -> bool:
+        return bool(self.rama_inicial and self.rama != self.rama_inicial)
+
+    @property
+    def config_dir(self) -> Path:
+        return CUENTAS[self.cuenta]
+
+    @property
+    def cwd_existe(self) -> bool:
+        return bool(self.cwd) and Path(self.cwd).is_dir()
+
+
+# Cuanto se lee de cada .jsonl. La cabeza trae cwd y rama inicial; la cola, la
+# rama final y el ultimo `aiTitle` (se regenera varias veces por sesion, asi que
+# el que vale es el ultimo). Leer los 338 archivos enteros seria ~350 MB; asi
+# son ~56 MB y 0.45 s, que no justifica cachear.
+CABEZA_LINEAS = 60
+COLA_BYTES = 65_536
+
+
+def _meta_sesion(jsonl: Path, tam: int) -> dict[str, str]:
+    m = {"cwd": "", "rama_inicial": "", "rama": "", "titulo": ""}
+    try:
+        with jsonl.open("rb") as fh:
+            cabeza = [fh.readline() for _ in range(CABEZA_LINEAS)]
+            if tam > COLA_BYTES:
+                fh.seek(tam - COLA_BYTES)
+                fh.readline()  # descartar la linea partida por el seek
+            else:
+                fh.seek(0)
+            cola = fh.readlines()
+    except OSError:
+        return m
+    # Cabeza primero y cola despues, a proposito: los campos "ultimos" (rama,
+    # titulo) se sobreescriben en orden cronologico.
+    for bloque, es_cabeza in ((cabeza, True), (cola, False)):
+        for cruda in bloque:
+            if not cruda.strip():
+                continue
+            try:
+                d = json.loads(cruda.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if d.get("cwd") and not m["cwd"]:
+                m["cwd"] = d["cwd"]
+            if d.get("gitBranch"):
+                if es_cabeza and not m["rama_inicial"]:
+                    m["rama_inicial"] = d["gitBranch"]
+                m["rama"] = d["gitBranch"]
+            if d.get("aiTitle"):
+                m["titulo"] = d["aiTitle"]
+    if not m["rama_inicial"]:
+        m["rama_inicial"] = m["rama"]
+    return m
 
 
 def inventario_sesiones() -> list[Sesion]:
@@ -308,16 +390,42 @@ def inventario_sesiones() -> list[Sesion]:
                 st = jsonl.stat()
             except OSError:
                 continue
+            m = _meta_sesion(jsonl, st.st_size)
             out.append(Sesion(
                 cuenta=cuenta,
                 # El slug del proyecto es el primer componente bajo projects/,
                 # no el directorio inmediato (hay sesiones anidadas).
+                #
+                # El slug SI se puede derivar del cwd (normalizando mayusculas y
+                # `_`->`-`): falla en 1 de 334, una sesion lanzada en un
+                # subdirectorio del repo. El cwd se guarda igual porque `resume`
+                # lo necesita para lanzar claude en el directorio correcto, y
+                # porque 4 sesiones no lo tienen registrado: esas no se pueden
+                # reanudar y hay que decirlo, no fallar raro.
                 proyecto=jsonl.relative_to(proyectos).parts[0],
                 session_id=jsonl.stem,
                 mb=st.st_size / 1_048_576,
                 dias=int((ahora - st.st_mtime) // 86400),
+                mtime=st.st_mtime,
+                **m,
             ))
     return sorted(out, key=lambda s: -s.mb)
+
+
+def buscar_sesiones(consulta: str, cuenta: str | None = None,
+                    dias: int | None = None) -> list[Sesion]:
+    """Sesiones que matchean rama, repo, slug o titulo. Mas reciente primero."""
+    q = consulta.lower().strip()
+    out = []
+    for s in inventario_sesiones():
+        if cuenta and s.cuenta != cuenta:
+            continue
+        if dias is not None and s.dias > dias:
+            continue
+        heno = " ".join((s.rama, s.rama_inicial, s.repo, s.proyecto, s.titulo)).lower()
+        if q in heno:
+            out.append(s)
+    return sorted(out, key=lambda s: -s.mtime)
 
 
 # --------------------------------------------------------------------------
@@ -452,8 +560,25 @@ def hallazgos(rel: Relevamiento) -> list[str]:
         h.append(
             f"[yellow]sesiones[/] {len(caras)} activas (<={DIAS_SESION_VIVA}d) por encima de "
             f"{UMBRAL_SESION_MB:.1f} MB, conviene cortarlas: "
-            + ", ".join(f"{s.proyecto}/{s.mb:.1f}MB" for s in caras[:4])
-            + (f" y {len(caras) - 4} mas" if len(caras) > 4 else "")
+            + ", ".join(f"{s.rama or s.proyecto} ({s.mb:.1f}MB)" for s in caras[:3])
+            + (f" y {len(caras) - 3} mas" if len(caras) > 3 else "")
+            + "  ->  factoria cortar <rama> --fork"
+        )
+
+    # El agujero de trazabilidad: una tarea con N conversaciones y ningun indice.
+    # 'HEAD' es detached, no una rama: agruparlo juntaria tareas sin relacion.
+    grupos: dict[tuple[str, str], list[Sesion]] = {}
+    for s in rel.sesiones:
+        if s.dias <= DIAS_SESION_VIVA and s.rama and s.rama != "HEAD":
+            grupos.setdefault((s.repo, s.rama), []).append(s)
+    multi = sorted(((k, v) for k, v in grupos.items() if len(v) > 1), key=lambda t: -len(t[1]))
+    if multi:
+        h.append(
+            f"[yellow]trazabilidad[/] {len(multi)} ramas tienen mas de una sesion viva "
+            f"({sum(len(v) for _, v in multi)} sesiones en total): sin indice, la proxima "
+            "vez abris una nueva. Peores: "
+            + ", ".join(f"{rm} ({len(v)})" for (_, rm), v in multi[:3])
+            + "  ->  factoria sesiones --paralelas"
         )
 
     sin_estado = [d for d in rel.docs if not d.explicito]
@@ -577,6 +702,208 @@ def board(docs: bool, ramas: bool, sesiones: bool, limite: int, como_json: bool)
     for linea in hs:
         console.print(f"  - {linea}")
     console.print()
+
+
+# --------------------------------------------------------------------------
+# Sesiones: inventario, resume, cortar (paso 3)
+# --------------------------------------------------------------------------
+
+def _render_sesiones(ss: list[Sesion], encabezado: str = "") -> None:
+    """Lista, no tabla: siete columnas no entran en una consola de 80 y rich
+    apila cada celda hasta volver la salida ilegible. Dos lineas por sesion:
+    identidad arriba, ubicacion abajo."""
+    if encabezado:
+        console.print(f"[bold]{encabezado}[/]")
+    for i, s in enumerate(ss, 1):
+        marca = "[yellow]*[/]" if s.mb >= UMBRAL_SESION_MB else " "
+        console.print(
+            f"{marca}[bold]{i:>3}[/]  [dim]{s.mb:>5.1f}MB {s.dias:>3}d[/]  "
+            f"{s.cuenta}/{s.repo}  {s.titulo or '[dim](sin titulo)[/]'}"
+        )
+        # Una sesion que empezo en otra rama es justo la que no conviene reanudar
+        # a ciegas: lo que buscás puede estar en la rama que dejo atras.
+        extra = f"  [dim](era {s.rama_inicial})[/]" if s.cambio_de_rama else ""
+        console.print(f"      [dim]{s.rama or '(sin rama)'}[/]{extra}")
+
+
+def _lanzar(s: Sesion, args: list[str], forzar: bool, imprimir: bool) -> None:
+    """Arranca claude con la cuenta y el cwd registrados de la sesion."""
+    binario = shutil.which("claude")
+    cmd = ["claude", *args]
+    receta = (f'set CLAUDE_CONFIG_DIR={s.config_dir}\n'
+              f'cd /d {s.cwd}\n'
+              f'{" ".join(cmd)}')
+    if imprimir:
+        console.print(receta)
+        return
+    if not s.cwd_existe:
+        raise click.ClickException(
+            f"el cwd registrado ya no existe: {s.cwd}\n"
+            "La sesion sigue en disco; si el worktree se borro, recrealo o usa --imprimir."
+        )
+    if os.environ.get("CLAUDECODE") and not forzar:
+        console.print(
+            "[yellow]Estas adentro de una sesion de Claude.[/] Anidar otra encima consume "
+            "tokens de las dos y el output se mezcla. Corre esto en una terminal aparte:\n"
+        )
+        console.print(receta)
+        console.print("\n[dim](o --forzar si de verdad querias anidarla)[/]")
+        return
+    if not binario:
+        raise click.ClickException("no encuentro `claude` en el PATH.")
+    entorno = os.environ.copy()
+    entorno["CLAUDE_CONFIG_DIR"] = str(s.config_dir)
+    console.print(f"[dim]{s.cuenta} | {s.cwd} | {s.rama or '(sin rama)'}[/]")
+    subprocess.run([binario, *args], cwd=s.cwd, env=entorno)
+
+
+def _elegir_una(ss: list[Sesion], consulta: str, elegir: int | None,
+                accion: str) -> Sesion:
+    if not ss:
+        raise click.ClickException(
+            f"ninguna sesion matchea '{consulta}'.\n"
+            "Probá `factoria sesiones` para ver el inventario, o acotá menos la consulta."
+        )
+    if elegir is not None:
+        if not 1 <= elegir <= len(ss):
+            raise click.ClickException(f"--elegir {elegir} fuera de rango (1..{len(ss)}).")
+        return ss[elegir - 1]
+    if len(ss) == 1:
+        return ss[0]
+    TOPE = 12
+    _render_sesiones(
+        ss[:TOPE],
+        f"{len(ss)} sesiones matchean '{consulta}'"
+        + (f" -- las {TOPE} mas recientes" if len(ss) > TOPE else ""),
+    )
+    console.print(
+        f"\nElegí una: [bold]factoria {accion} {consulta} --elegir N[/]  "
+        "(la #1 es la mas reciente)"
+    )
+    if len(ss) > TOPE:
+        console.print("[dim]O acotá la busqueda: --cuenta dfv|personal, --dias N, o una "
+                      "consulta mas especifica (la rama discrimina mejor que el repo).[/]")
+    raise SystemExit(1)
+
+
+@cli.command()
+@click.option("--repo", help="Filtrar por repo o slug de proyecto.")
+@click.option("--rama", help="Filtrar por rama.")
+@click.option("--cuenta", type=click.Choice(list(CUENTAS)), help="Filtrar por cuenta.")
+@click.option("--dias", default=DIAS_SESION_VIVA, show_default=True,
+              help="Solo sesiones tocadas hace <= N dias. 0 = todas.")
+@click.option("--limite", default=20, show_default=True, help="Filas.")
+@click.option("--paralelas", is_flag=True,
+              help="Solo ramas con MAS DE UNA sesion: el agujero de trazabilidad.")
+@click.option("--json", "como_json", is_flag=True, help="Volcado crudo.")
+def sesiones(repo: str | None, rama: str | None, cuenta: str | None, dias: int,
+             limite: int, paralelas: bool, como_json: bool) -> None:
+    """Inventario de sesiones con su repo, rama, titulo y tamano. Solo lectura."""
+    ss = inventario_sesiones()
+    total = len(ss)
+    if cuenta:
+        ss = [s for s in ss if s.cuenta == cuenta]
+    if repo:
+        q = repo.lower()
+        ss = [s for s in ss if q in s.repo.lower() or q in s.proyecto.lower()]
+    if rama:
+        q = rama.lower()
+        ss = [s for s in ss if q in s.rama.lower() or q in s.rama_inicial.lower()]
+    if dias:
+        ss = [s for s in ss if s.dias <= dias]
+
+    if como_json:
+        click.echo(json.dumps([{**vars(s), "repo": s.repo} for s in ss],
+                              indent=2, ensure_ascii=False))
+        return
+
+    if paralelas:
+        grupos: dict[tuple[str, str], list[Sesion]] = {}
+        sin_rama = 0
+        for s in ss:
+            # 'HEAD' es detached, no una rama: agrupar por eso juntaria sesiones
+            # de tareas sin ninguna relacion. Se cuentan aparte.
+            if not s.rama or s.rama == "HEAD":
+                sin_rama += 1
+                continue
+            grupos.setdefault((s.repo, s.rama), []).append(s)
+        multi = sorted(((k, v) for k, v in grupos.items() if len(v) > 1),
+                       key=lambda t: -len(t[1]))
+        console.print()
+        console.print(f"[bold]Ramas con mas de una sesion[/]  |  <= {dias}d  |  "
+                      f"{len(multi)} ramas, {sum(len(v) for _, v in multi)} sesiones")
+        t = Table(title_justify="left", header_style="bold")
+        t.add_column("repo")
+        t.add_column("rama", overflow="fold")
+        t.add_column("ses", justify="right")
+        t.add_column("cuentas")
+        t.add_column("MB", justify="right")
+        for (rp, rm), v in multi[:limite]:
+            cs = sorted({x.cuenta for x in v})
+            t.add_row(rp, rm, str(len(v)), "+".join(cs), f"{sum(x.mb for x in v):.1f}")
+        console.print(t)
+        console.print("  [dim]cada fila es una tarea a la que le vas a abrir una sesion "
+                      "mas por no saber cual reanudar[/]")
+        if sin_rama:
+            console.print(f"  [dim]{sin_rama} sesiones sin rama o en detached HEAD, "
+                          "no agrupables[/]")
+        console.print()
+        return
+
+    console.print()
+    console.print(f"[bold]Sesiones[/]  |  {len(ss)} de {total}"
+                  f"  |  {sum(s.mb for s in ss):.0f} MB")
+    _render_sesiones(sorted(ss, key=lambda s: -s.mtime)[:limite])
+    if len(ss) > limite:
+        console.print(f"  [dim]... y {len(ss) - limite} mas[/]")
+    console.print()
+
+
+@cli.command()
+@click.argument("consulta")
+@click.option("--cuenta", type=click.Choice(list(CUENTAS)), help="Acotar a una cuenta.")
+@click.option("--elegir", type=int, help="Indice de la lista cuando matchean varias.")
+@click.option("--dias", default=0, help="Solo sesiones de hace <= N dias. 0 = todas.")
+@click.option("--imprimir", is_flag=True, help="Mostrar el comando sin ejecutarlo.")
+@click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
+def resume(consulta: str, cuenta: str | None, elegir: int | None, dias: int,
+           imprimir: bool, forzar: bool) -> None:
+    """Reanuda la sesion de una tarea: continua la conversacion, no abre otra."""
+    ss = buscar_sesiones(consulta, cuenta, dias or None)
+    s = _elegir_una(ss, consulta, elegir, "resume")
+    if s.mb >= UMBRAL_SESION_MB:
+        console.print(
+            f"[yellow]Ojo:[/] esta sesion pesa {s.mb:.1f} MB (umbral {UMBRAL_SESION_MB}). "
+            "Cada turno paga lectura de cache sobre todo ese prefijo.\n"
+            f"[dim]Alternativa: factoria cortar {consulta} --fork[/]\n"
+        )
+    _lanzar(s, ["-r", s.session_id], forzar, imprimir)
+
+
+@cli.command()
+@click.argument("consulta")
+@click.option("--fork", is_flag=True,
+              help="Ramificar desde la sesion actual, preservandola intacta.")
+@click.option("--cuenta", type=click.Choice(list(CUENTAS)))
+@click.option("--elegir", type=int)
+@click.option("--imprimir", is_flag=True)
+@click.option("--forzar", is_flag=True)
+def cortar(consulta: str, fork: bool, cuenta: str | None, elegir: int | None,
+           imprimir: bool, forzar: bool) -> None:
+    """Corta una sesion cara. Con --fork ramifica; sin el, arranca limpia."""
+    ss = buscar_sesiones(consulta, cuenta, None)
+    s = _elegir_una(ss, consulta, elegir, "cortar")
+    if fork:
+        _lanzar(s, ["-r", s.session_id, "--fork-session"], forzar, imprimir)
+        return
+    console.print(
+        f"[yellow]Sesion nueva y limpia[/] en {s.cwd} ({s.cuenta}), rama "
+        f"{s.rama or '(sin rama)'}.\n"
+        f"[dim]La anterior queda intacta: factoria resume {consulta} --elegir 1[/]\n"
+        "[dim]El pack de contexto automatico (`factoria contexto`) llega en el paso 6; "
+        "por ahora la sesion arranca solo con el CLAUDE.md del repo.[/]\n"
+    )
+    _lanzar(s, [], forzar, imprimir)
 
 
 if __name__ == "__main__":
