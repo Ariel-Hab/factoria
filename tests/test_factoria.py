@@ -380,3 +380,13 @@ def test_tildar_un_criterio_no_es_spec_drift():
     # pero editar el TEXTO de un criterio si tiene que saltar
     c = fx.Ticket(slug="x", cuerpo=base.replace("- [ ] uno", "- [ ] uno y medio"))
     assert fx.huella_spec(a) != fx.huella_spec(c)
+
+
+def test_toda_sesion_arranca_con_el_repo_de_datos_habilitado():
+    """El ticket y su doc viven afuera de todo repo de codigo: sin --add-dir la
+    primera lectura de cualquier sesion se para en un pedido de permiso."""
+    import inspect
+    src = inspect.getsource(fx._lanzar_en)
+    assert '"--add-dir", str(DATOS)' in src
+    i, j = src.index("--add-dir"), src.index("list2cmdline")
+    assert i < j, "tiene que entrar en args ANTES de armar la receta"

@@ -954,6 +954,13 @@ def _lanzar_en(cuenta: str, cwd: str, args: list[str], forzar: bool, imprimir: b
     dejar el ticket apuntando a una sesion que nunca se abrio.
     """
     config_dir = CUENTAS[cuenta]
+    # El repo de datos esta afuera de TODOS los repos de codigo, asi que sin
+    # esto lo primero que hace cualquier sesion -- leer su ticket, su doc de
+    # trabajo, o el pack que le inyecta `resume --nueva` -- se para en un pedido
+    # de permiso por path fuera del proyecto. Se vio en la prueba del ultimo
+    # criterio: la sesion nueva arranco, se titulo, y no hizo nada mas.
+    # Habilita ese directorio y nada mas: no es un --dangerously-skip.
+    args = ["--add-dir", str(DATOS), *args]
     # list2cmdline y no un join: uno de los args puede ser el prompt inicial,
     # que lleva espacios y comillas.
     receta = (f"set CLAUDE_CONFIG_DIR={config_dir}\n"
