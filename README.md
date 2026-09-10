@@ -83,7 +83,7 @@ factoria abrir <slug>           # abre el issue de GitHub en el navegador
 |---|---|
 | `espejo [<slug>] [--todos] [--probar]` | ticket → issue + tarjeta del Project. Una sola vía |
 | `skills [<fase>]` | qué skill de mattpocock usar en cada fase, y cuál queda afuera |
-| `sync-skills [--desvincular]` | vincula skills y agents del repo a los dos config dirs |
+| `sync-skills [--desvincular]` | vincula las skills y agents del repo de datos a los dos config dirs |
 | `perfiles` | genera un perfil por repo detectando dónde van sus docs |
 | `rama <slug> <nueva> [--solo-registro]` | renombra la rama. `--solo-registro` si la rama es ajena |
 | `renombrar <slug> <nuevo>` | renombra el ticket, sus docs y sus ramas |

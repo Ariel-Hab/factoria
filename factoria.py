@@ -2630,6 +2630,14 @@ def es_junction(p: Path) -> bool:
         return False
 
 
+def _mismo_dir(a: Path, b: Path) -> bool:
+    """Si los dos paths son el mismo directorio en disco, junctions mediante."""
+    try:
+        return os.path.samefile(str(a), str(b))
+    except OSError:
+        return False
+
+
 def _vincular(enlace: Path, destino: Path) -> str:
     """Crea la junction, o dice por que no. Nunca sobrescribe un directorio real."""
     if not destino.is_dir():
@@ -2637,7 +2645,11 @@ def _vincular(enlace: Path, destino: Path) -> str:
     if enlace.exists() or enlace.is_symlink():
         if es_junction(enlace):
             actual = Path(os.readlink(str(enlace)))
-            if actual.resolve() == destino.resolve():
+            # samefile, y no comparar los paths: os.readlink devuelve la junction
+            # con el prefijo de path extendido (\\?\C:\...), que resolve() conserva:
+            # la igualdad daba False siempre y toda junction correcta se reportaba
+            # apuntando a otro lado.
+            if _mismo_dir(enlace, destino):
                 return "ya vinculado"
             return f"[yellow]junction apunta a otro lado[/] ({actual})"
         return ("[yellow]hay un directorio real, no una junction[/] -- puede tener "
@@ -2656,7 +2668,7 @@ def _vincular(enlace: Path, destino: Path) -> str:
 @click.option("--copiar", is_flag=True,
               help="Copiar en vez de vincular, si el descubrimiento no sigue junctions.")
 def sync_skills(desvincular: bool, copiar: bool) -> None:
-    """Vincula skills y agents del repo de codigo a los dos config dirs.
+    """Vincula skills y agents del repo de DATOS a los dos config dirs.
 
     Hoy handoff/SKILL.md, ship/SKILL.md, buscador.md y planificador.md son
     byte-identicos entre las dos cuentas y hay que editarlos dos veces. La
