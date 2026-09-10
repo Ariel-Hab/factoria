@@ -596,6 +596,20 @@ def hallazgos(rel: Relevamiento) -> list[str]:
         if (p := wt.problema(rel.bases.get(wt.repo, ""))):
             h.append(f"[red]worktree miente[/] {wt.repo}: {Path(wt.path).name} -> {p}")
 
+    # `setup-matt-pocock-skills` deja este archivo versionado en la raiz del
+    # repo, y con el entran las skills que guardan el estado del trabajo en un
+    # tracker por repo -- la invariante inversa a la de factoria, donde los .md
+    # son canonicos. Se descarto, asi que si aparece es que alguien corrio el
+    # setup: la decision se sostiene porque se mide, no porque este escrita.
+    intrusos = [r.name for r in rel.repos if (r / "docs" / "agents").is_dir()]
+    if intrusos:
+        h.append(
+            f"[yellow]tracker ajeno[/] docs/agents/ versionado en "
+            f"{', '.join(intrusos)}: lo escribe `setup-matt-pocock-skills`, que "
+            "esta descartado (factoria skills). Borralo o el `code-review` va a "
+            "leer un tracker que no es el tuyo"
+        )
+
     for repo, (linea, largo) in sorted(rel.estado_actual.items(), key=lambda t: -t[1][1]):
         if largo > COTA_ESTADO_ACTUAL:
             h.append(
@@ -1660,6 +1674,105 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     _lanzar_en(cta, str(rp), ["--session-id", sid], forzar, False, rama)
 
 
+# --- Skills de mattpocock: cuales se usan, y por que las otras no ------------
+#
+# El plugin trae 43 skills. Se adoptan las que aportan juicio sobre contenido
+# (lo que factoria deliberadamente NO hace) y que no necesitan un tracker.
+#
+# Quedan afuera `to-spec`, `to-tickets`, `triage` y `wayfinder`: guardan el
+# estado del trabajo EN el tracker. factoria ya tiene el suyo y su invariante
+# es la inversa -- los .md son canonicos, la API es espejo. Adoptarlas moveria
+# la verdad a la red, y `contexto` y `grafo.json` existen para arrancar una
+# sesion sin ella.
+#
+# Y no se corre `setup-matt-pocock-skills`, que es lo que las habilitaria:
+# escribe `docs/agents/issue-tracker.md` versionado en cada repo. En defeve no
+# se crean directorios versionados -- es la misma razon por la que `.ia/` esta
+# gitignored y por la que este perfil tiene `docs: central`.
+MP = "/mattpocock-skills"
+
+SKILLS_POR_FASE: dict[str, tuple[tuple[str, str], ...]] = {
+    "plan": (
+        ("grilling", "llena '## Supuestos abiertos' interrogandote: el unico "
+                     "dispositivo anti-malinterpretacion que tiene el ticket"),
+        ("prototype", "contesta una duda de diseño con codigo tirable, antes "
+                      "de que el criterio de aceptacion la congele"),
+        ("to-questionnaire", "cuando la duda la tiene que contestar otro y no vos"),
+        ("codebase-design", "vocabulario de modulos profundos; no escribe archivos"),
+    ),
+    "dev": (
+        ("tdd", "los tests que deja son los `verify:` que le faltan al perfil "
+                "para que `check` sea un DoD y no un linter de cotas"),
+        ("diagnosing-bugs", "para los tickets `fix/`"),
+        ("implement", "ejecuta el ticket ya aprobado, sin volver a discutirlo"),
+    ),
+    "test": (
+        ("code-review", "dos ejes, Standards y Spec. Pasale el ticket como spec "
+                        "y no necesita tracker: es la opcion 2 de su busqueda"),
+        ("resolving-merge-conflicts", "si el compare que imprime `close` sale con conflictos"),
+    ),
+    "cerrado": (
+        ("retro", "que de esta sesion deberia ser un check de `factoria check` "
+                  "en vez de una instruccion que hay que recordar"),
+        ("writing-for-agents", "para editar las skills propias y los CLAUDE.md"),
+    ),
+}
+
+# Sirven en cualquier fase, asi que no se repiten en cada cambio de fase.
+SKILLS_TRANSVERSALES: tuple[tuple[str, str], ...] = (
+    ("handoff", "compacta la conversacion. Es el de `productivity`, homonimo "
+                "del propio: aquel arma contratos cross-repo, este comprime "
+                "una sesion. Conviven porque va con prefijo"),
+    ("wizard", "genera un wizard de bash para los pasos que solo podes hacer "
+               "vos: `gh auth`, paneles de terceros, migraciones de una vez"),
+    ("git-guardrails-claude-code", "bloquea push/reset --hard/branch -D por "
+                                   "hook. No choca con `commit`: es la capa de abajo"),
+)
+
+SKILLS_DESCARTADAS: tuple[tuple[str, str], ...] = (
+    ("to-spec", "publica el spec al tracker; aca el spec es el ticket .md"),
+    ("to-tickets", "publica los slices al tracker. Su idea de aristas de "
+                   "bloqueo ya vive en `bloquea` del grafo"),
+    ("triage", "maquina de estados propia sobre issues; se pisa con `fase`"),
+    ("wayfinder", "el mapa ES un issue del tracker, con hijos y queries"),
+    ("setup-matt-pocock-skills", "escribe docs/agents/ versionado en el repo"),
+    ("setup-pre-commit", "Husky + lint-staged, y el Node de aca es v12.22. "
+                         "`check --instalar-pre-push` ya ocupa ese lugar"),
+)
+
+
+def _repos_centrales(t: Ticket) -> list[str]:
+    """Repos del ticket donde el doc de trabajo no se versiona.
+
+    Ahi ninguna skill puede dejar `CONTEXT.md` ni `docs/adr/` en la raiz: van
+    a .factoria/docs/<repo>/. Es la misma razon por la que existe `docs:
+    central`, y la unica objecion real que tienen las skills que si se adoptan.
+    """
+    return [e.repo for e in t.repos if perfil(e.repo).get("docs") == "central"]
+
+
+def _render_skills(items: tuple[tuple[str, str], ...]) -> None:
+    for nombre, para_que in items:
+        console.print(f"  [bold]{MP}:{nombre}[/]\n    [dim]{para_que}.[/]")
+
+
+@cli.command("skills")
+@click.argument("fase_arg", required=False, type=click.Choice(FASES))
+def skills_cmd(fase_arg: str | None) -> None:
+    """Que skill de mattpocock usar en cada fase, y cual queda afuera y por que."""
+    for f in ([fase_arg] if fase_arg else list(SKILLS_POR_FASE)):
+        console.print(f"\n[bold]fase {f}[/]")
+        _render_skills(SKILLS_POR_FASE.get(f, ()))
+    if fase_arg:
+        return
+    console.print("\n[bold]en cualquier fase[/]")
+    _render_skills(SKILLS_TRANSVERSALES)
+    console.print("\n[bold]afuera[/] [dim](guardan estado en un tracker por repo, "
+                  "o escriben directorios versionados)[/]")
+    for nombre, motivo in SKILLS_DESCARTADAS:
+        console.print(f"  [dim]{nombre} — {motivo}.[/]")
+
+
 @cli.command("fase")
 @click.argument("slug")
 @click.argument("nueva", type=click.Choice(FASES))
@@ -1694,20 +1807,29 @@ def fase_cmd(slug: str, nueva: str) -> None:
     destino = DATOS / "handoffs" / f"{t.slug}-{previa}.md"
     if not destino.is_file():
         console.print(
-            f"\n[bold]Handoff de {previa}:[/] corré [bold]/mattpocock-skills:handoff[/] "
+            f"\n[bold]Handoff de {previa}:[/] corré [bold]{MP}:handoff[/] "
             f"y guardá la salida en\n  {destino}\n"
             "[dim]Va afuera del ticket para no romperle la cota de 120 lineas.[/]"
         )
-    sugerencias = {
-        "plan": "[bold]/mattpocock-skills:grilling[/] para llenar 'Supuestos abiertos', "
-                "y [bold]/mattpocock-skills:to-spec[/] para los criterios de aceptacion",
-        "dev": "[bold]/mattpocock-skills:tdd[/] -- los tests que deja son los `verify:` "
-               "que le faltan al perfil para que `check` sirva de DoD",
-        "test": "[bold]/mattpocock-skills:code-review[/] -- su eje Spec lee el issue de "
-                f"origen, que aca es {t.issue_url or 'el que cree `factoria espejo`'}",
-    }
-    if (sug := sugerencias.get(nueva)):
-        console.print(f"\n[bold]Para la fase {nueva}:[/] {sug}")
+    if (sugeridas := SKILLS_POR_FASE.get(nueva)):
+        console.print(f"\n[bold]Para la fase {nueva}:[/]")
+        _render_skills(sugeridas)
+    if nueva == "test" and t.repos:
+        # Su eje Spec busca el issue de origen via tracker primero, pero acepta
+        # un path como opcion 2. Pasandole el ticket no hace falta ningun tracker.
+        # El punto fijo es el ancestro real, no el default del repo: 30 de 57
+        # ramas de defeve salen de `desarrollo-ari` y diffear contra master les
+        # atribuye los 241 archivos de la intermedia.
+        e = t.repos[0]
+        rp = Path(e.cwd)
+        base = (base_efectiva(rp, e.rama, perfil(e.repo).get("base", "main"))
+                if e.rama and rp.is_dir() else perfil(e.repo).get("base", "main"))
+        console.print(f"  [dim]{MP}:code-review {base} {t.path}[/]")
+    if nueva == "plan" and (cs := _repos_centrales(t)):
+        console.print(
+            f"\n[dim]En {', '.join(cs)} el doc de trabajo no se versiona: si una skill "
+            f"quiere dejar CONTEXT.md o docs/adr/, mandalo a {DATOS / 'docs'} y no a la "
+            "raiz del repo.[/]")
 
 
 @cli.command()
