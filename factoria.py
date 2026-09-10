@@ -37,7 +37,9 @@ DATOS = ARIEL / ".factoria"
 CONTRATOS = ARIEL / "dfv" / ".contracts"
 RAICES = [ARIEL / "dfv", ARIEL / "integhra"]
 # gstack es un template de terceros; skills/~ es un directorio espurio.
-IGNORAR_REPOS = {"gstack", "skills", "factoria"}
+# `factoria` NO se ignora: la herramienta se trackea con la herramienta, y
+# estaba excluida solo porque cuando se escribio esto todavia no tenia .git.
+IGNORAR_REPOS = {"gstack", "skills"}
 
 CUENTAS = {
     "dfv": Path.home() / ".claude-dfv",
@@ -695,6 +697,14 @@ def hallazgos(rel: Relevamiento) -> list[str]:
                 + "  ->  factoria grafo --que-toca <archivo>"
             )
 
+    derivados = [t for t in rel.tickets
+                 if t.spec_congelado and huella_spec(t) != t.spec_congelado]
+    if derivados:
+        h.append(
+            f"[red]spec-drift[/] {len(derivados)} tickets cambiaron criterios o fuera de "
+            "alcance despues de aprobarse: " + ", ".join(t.slug for t in derivados[:3])
+            + ". No es un error en si; es que lo que se aprobo ya no es lo que dice"
+        )
     sin_espejo = [t for t in rel.tickets if t.abierto and not t.issue]
     if sin_espejo and (DATOS / "github.yml").is_file():
         h.append(
@@ -1348,6 +1358,34 @@ def sembrar_perfiles(sobrescribir: bool = False) -> list[str]:
             "cuenta": dominante.get(r.name, "dfv"),
             "docs": "ai-tasks" if (r / ".ai" / "tasks").is_dir() else "central",
             "base": base_de(r) or "main",
+            # Guardas heredadas de los hooks Stop que este comando reemplaza.
+            "ramas_prohibidas": [
+                b for b in ("master", "main", *BASES_CANDIDATAS)
+                if b in ("master", "main") or existe_rama(r, b)
+            ],
+            "proteger_commit": (
+                ["api-grails/grails-app/conf/DataSource.groovy"]
+                if (r / "api-grails" / "grails-app" / "conf" / "DataSource.groovy").exists()
+                else []
+            ),
+            "excluir_commit": ["**/__pycache__", "**/*.pyc", "**/*.pyo"],
+            # Ritual de §10.1/§10.3, solo donde ya lo usas de verdad.
+            "worktree": (r.parent / "wt").is_dir(),
+            "worktree_raiz": str(r.parent / "wt"),
+            "copiar_al_worktree": [
+                p for p in ("CLAUDE.md", ".claude/settings.local.json",
+                            "api-grails/grails-app/conf/DataSource.groovy",
+                            "intranet/src/environments/environment.ts")
+                if (r / p).is_file()
+            ],
+            "skip_worktree": [
+                p for p in ("api-grails/grails-app/conf/DataSource.groovy",)
+                if (r / p).is_file()
+            ],
+            "junctions": [
+                p for p in ("api-grails/target", "intranet/node_modules", "node_modules")
+                if (r / p).is_dir()
+            ],
         }
         p.write_text(
             "# Perfil de repo para factoria. `docs: ai-tasks` mete el doc de trabajo\n"
@@ -2301,6 +2339,582 @@ def contexto_cmd(slug: str, max_vecinos: int) -> None:
         partes += ["---", "", "## Contratos que toca", ""]
         partes += [f"- `.contracts\\{c.split(':', 1)[-1]}.md`" for c in contratos]
     click.echo("\n".join(partes))
+
+
+# --------------------------------------------------------------------------
+# sync-skills: una sola fuente de verdad para skills y agents (plan §5)
+# --------------------------------------------------------------------------
+
+def es_junction(p: Path) -> bool:
+    try:
+        return p.is_dir() and bool(os.readlink(str(p)))
+    except OSError:
+        return False
+
+
+def _vincular(enlace: Path, destino: Path) -> str:
+    """Crea la junction, o dice por que no. Nunca sobrescribe un directorio real."""
+    if not destino.is_dir():
+        return f"[red]falta el origen[/] {destino}"
+    if enlace.exists() or enlace.is_symlink():
+        if es_junction(enlace):
+            actual = Path(os.readlink(str(enlace)))
+            if actual.resolve() == destino.resolve():
+                return "ya vinculado"
+            return f"[yellow]junction apunta a otro lado[/] ({actual})"
+        return ("[yellow]hay un directorio real, no una junction[/] -- puede tener "
+                "cambios propios; revisalo y borralo a mano")
+    enlace.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(enlace), str(destino)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        return f"[red]mklink falló[/] {(r.stderr or r.stdout).strip()[:120]}"
+    return "vinculado"
+
+
+@cli.command("sync-skills")
+@click.option("--desvincular", is_flag=True,
+              help="Quitar las junctions (con rmdir, no borrado recursivo).")
+@click.option("--copiar", is_flag=True,
+              help="Copiar en vez de vincular, si el descubrimiento no sigue junctions.")
+def sync_skills(desvincular: bool, copiar: bool) -> None:
+    """Vincula skills y agents del repo de codigo a los dos config dirs.
+
+    Hoy handoff/SKILL.md, ship/SKILL.md, buscador.md y planificador.md son
+    byte-identicos entre las dos cuentas y hay que editarlos dos veces. La
+    granularidad no es uniforme a proposito: `skills\\<nombre>` va por skill
+    porque .claude-personal tiene 17 skills de superpowers que una junction del
+    directorio entero taparia; `agents` va completo porque las dos cuentas
+    tienen exactamente los mismos dos agentes.
+    """
+    # Viven en el repo de DATOS, que es privado, y no en el de codigo, que es
+    # publico: estas skills nombran repos internos, roles y rutas de la empresa.
+    origen_skills, origen_agents = DATOS / "skills", DATOS / "agents"
+    console.print()
+    if not origen_skills.is_dir() and not origen_agents.is_dir():
+        console.print(f"[yellow]No hay `skills/` ni `agents/` en {DATOS}.[/]")
+        console.print("[dim]Primero hay que mover los archivos del config dir al repo:"
+                      " son la fuente de verdad. `--copiar` no aplica todavia.[/]")
+        console.print()
+        return
+
+    mios = sorted(p.name for p in origen_skills.iterdir() if p.is_dir()) \
+        if origen_skills.is_dir() else []
+    for cuenta, raiz in CUENTAS.items():
+        console.print(f"[bold]{cuenta}[/]  {raiz}")
+        for nombre in mios:
+            enlace = raiz / "skills" / nombre
+            if desvincular:
+                console.print(f"  skills/{nombre:<20} {_desvincular(enlace)}")
+            elif copiar:
+                console.print(f"  skills/{nombre:<20} {_copiar_dir(origen_skills / nombre, enlace)}")
+            else:
+                console.print(f"  skills/{nombre:<20} {_vincular(enlace, origen_skills / nombre)}")
+        if origen_agents.is_dir():
+            enlace = raiz / "agents"
+            if desvincular:
+                console.print(f"  agents{'':<21} {_desvincular(enlace)}")
+            elif copiar:
+                console.print(f"  agents{'':<21} {_copiar_dir(origen_agents, enlace)}")
+            else:
+                console.print(f"  agents{'':<21} {_vincular(enlace, origen_agents)}")
+    console.print()
+    if not desvincular and not copiar:
+        console.print("[dim]Verificá que Claude Code siga las junctions: abrí una sesion "
+                      "y pedile la lista de skills. Si no aparecen, `--copiar`.[/]")
+        console.print()
+
+
+def _desvincular(enlace: Path) -> str:
+    """Saca la junction con rmdir. NUNCA borrado recursivo: una junction es un
+    reparse point y un rm -r lo atraviesa, llevandose el repo de codigo."""
+    if not (enlace.exists() or enlace.is_symlink()):
+        return "no existe"
+    if not es_junction(enlace):
+        return "[yellow]es un directorio real, no se toca[/]"
+    r = subprocess.run(["cmd", "/c", "rmdir", str(enlace)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return "desvinculado" if r.returncode == 0 else \
+        f"[red]rmdir falló[/] {(r.stderr or r.stdout).strip()[:100]}"
+
+
+def _copiar_dir(origen: Path, destino: Path) -> str:
+    if es_junction(destino):
+        return "[yellow]hay una junction; --desvincular primero[/]"
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for f in origen.rglob("*"):
+        if f.is_file():
+            d = destino / f.relative_to(origen)
+            d.parent.mkdir(parents=True, exist_ok=True)
+            d.write_bytes(f.read_bytes())
+            n += 1
+    return f"copiado ({n} archivos)"
+
+
+# --------------------------------------------------------------------------
+# commit: reemplazo del auto-commit (paso 7)
+# --------------------------------------------------------------------------
+
+COTA_MENSAJE = 60
+TIPOS_COMMIT = ("feat", "fix", "chore", "refactor", "docs", "test", "perf",
+                "build", "ci", "style", "config", "wip")
+RE_MENSAJE = re.compile(rf"^({'|'.join(TIPOS_COMMIT)})(\([a-z0-9._/-]+\))?: \S.*$")
+
+# Guardas que ya tenian los hooks y no se pierden en el reemplazo.
+RAMAS_PROHIBIDAS = ("master", "main", "desarrollo-ari", "HEAD", "")
+
+
+def path_msg(repo: str, rama: str) -> Path:
+    """Un archivo por repo+rama: con varias sesiones en paralelo, un solo
+    `.factoria/msg` seria una carrera y una sesion commitearia el mensaje de otra."""
+    seguro = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{repo}__{rama}").strip("-")
+    return DATOS / "msg" / f"{seguro}.txt"
+
+
+def validar_mensaje(m: str) -> str | None:
+    """Devuelve el motivo del rechazo, o None si esta bien."""
+    m = m.strip()
+    if not m:
+        return "esta vacio"
+    if "\n" in m:
+        return "tiene mas de una linea"
+    if len(m) > COTA_MENSAJE:
+        return f"{len(m)} caracteres, cota {COTA_MENSAJE}"
+    if not RE_MENSAJE.match(m):
+        return (f"no tiene la forma `<tipo>: <imperativo>` con tipo en "
+                f"{'/'.join(TIPOS_COMMIT[:6])}/...")
+    if m.rstrip().endswith("."):
+        return "termina en punto"
+    return None
+
+
+@cli.command("commit")
+@click.option("--mensaje", help="El mensaje. Sin esto se lee el archivo de la sesion.")
+@click.option("--imprimir-hook", is_flag=True,
+              help="Imprime el stanza de settings.local.json para pegar.")
+@click.option("--seco", is_flag=True, help="Mostrar que haria, sin commitear.")
+def commit_cmd(mensaje: str | None, imprimir_hook: bool, seco: bool) -> None:
+    """Commitea con un mensaje breve y validado. Pensado para el hook Stop."""
+    if imprimir_hook:
+        console.print("""
+Pegar en el `settings.local.json` del repo, reemplazando el hook Stop que hoy
+hace `auto-commit (claude): <timestamp>`:
+
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "factoria commit" } ] }
+    ]
+  }
+
+factoria NO edita ese archivo: es tu configuracion y puede tener otros hooks
+(en defeve hay un PostToolUse que bloquea con exit 2 si el Groovy no compila,
+y un portero-roles.sh en Stop). El orden importa: dejá `factoria commit`
+DESPUES de los hooks que validan.
+
+El agente escribe el mensaje antes de terminar el turno:
+  factoria commit --mensaje "fix: cerrar el modal al anular"
+o lo deja en el archivo que `factoria commit --seco` te muestra.
+""".strip())
+        return
+
+    rp = repo_del_cwd()
+    if not rp:
+        # Silencioso: el hook corre en cualquier sesion, no solo en un repo.
+        return
+    rama = git(rp, "rev-parse", "--abbrev-ref", "HEAD")
+    pf = perfil(rp.name)
+    prohibidas = tuple(pf.get("ramas_prohibidas") or RAMAS_PROHIBIDAS)
+    if rama in prohibidas:
+        if seco:
+            console.print(f"[dim]{rp.name}: rama '{rama}' protegida, no se commitea.[/]")
+        return
+
+    archivo = path_msg(rp.name, rama)
+    if not mensaje and archivo.is_file():
+        mensaje = archivo.read_text(encoding="utf-8", errors="replace").strip()
+    # Sin mensaje se commitea igual, marcado: perder el trabajo es peor que un
+    # mensaje pobre, y `board` lo reporta.
+    fallback = not mensaje
+    if fallback:
+        t = next((x for x in tickets_todos()
+                  for e in x.repos if e.rama == rama and e.repo == rp.name), None)
+        mensaje = f"wip: {t.slug if t else rama.rsplit('/', 1)[-1]}"[:COTA_MENSAJE]
+    if (motivo := validar_mensaje(mensaje)):
+        raise click.ClickException(
+            f"mensaje rechazado ({motivo}):\n  {mensaje}\n"
+            f"Forma: `<tipo>: <imperativo>`, hasta {COTA_MENSAJE} caracteres, "
+            "sin punto final."
+        )
+
+    excluir = [f":(exclude){p}" for p in (pf.get("excluir_commit") or [])]
+    proteger = list(pf.get("proteger_commit") or [])
+    if seco:
+        console.print(f"[bold]{rp.name}[/] rama {rama}")
+        console.print(f"  mensaje   {mensaje}" + ("  [yellow](fallback)[/]" if fallback else ""))
+        console.print(f"  archivo   {archivo}")
+        console.print(f"  excluye   {', '.join(pf.get('excluir_commit') or []) or '-'}")
+        console.print(f"  protege   {', '.join(proteger) or '-'}")
+        console.print(f"  cambios   {len(git(rp, 'status', '--porcelain').splitlines())} archivos")
+        return
+
+    _git_o_falla(rp, "add", "-A", "--", ".", *excluir)
+    for p in proteger:
+        subprocess.run(["git", "-C", str(rp), "reset", "-q", "--", p],
+                       capture_output=True, text=True)
+    hay = subprocess.run(["git", "-C", str(rp), "diff", "--cached", "--quiet"],
+                         capture_output=True, text=True)
+    if hay.returncode == 0:
+        return  # nada staged
+    _git_o_falla(rp, "commit", "-q", "-m", mensaje)
+    if archivo.is_file():
+        archivo.unlink()
+    console.print(f"[dim]{rp.name} {rama}: {mensaje}[/]")
+
+
+# --------------------------------------------------------------------------
+# aprobar / open / close (paso 9). Aca el spec adquiere dientes: `open` se
+# niega si no esta aprobado, y esa negativa es el unico mecanismo que pone el
+# requerimiento antes del codigo.
+# --------------------------------------------------------------------------
+
+def huella_spec(t: Ticket) -> str:
+    """Hash de criterios + fuera de alcance. Es una constancia, no una firma:
+    su valor es que la deriva se vuelve detectable."""
+    import hashlib
+    material = "\n".join(
+        _seccion(t.cuerpo, e) for e in ("## Criterios de aceptación", "## Fuera de alcance")
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def url_compare(rp: Path, base: str, rama: str) -> str:
+    u = git(rp, "remote", "get-url", "origin")
+    if not u:
+        return ""
+    if u.startswith("git@"):  # git@host:ws/repo.git
+        u = "https://" + u[4:].replace(":", "/", 1)
+    u = u.removesuffix(".git")
+    if "bitbucket.org" in u:
+        # Bitbucket no tiene /compare: la vista de la rama es el equivalente util.
+        return f"{u}/branch/{rama}"
+    return f"{u}/compare/{base}...{rama}"
+
+
+@cli.command("aprobar")
+@click.argument("slug")
+def aprobar_cmd(slug: str) -> None:
+    """Congela criterios y fuera de alcance. Habilita `open` en otros repos."""
+    t = buscar_ticket(slug)
+    faltan = [e for e in ("## Criterios de aceptación", "## Fuera de alcance")
+              if not _tiene_items(t.cuerpo, e)]
+    if faltan:
+        raise click.ClickException(
+            "no puedo aprobar un spec con secciones vacias: "
+            + ", ".join(f.replace("## ", "") for f in faltan)
+            + f"\nEditá {t.path} y volvé a correr."
+        )
+    if not _tiene_items(t.cuerpo, "## Supuestos abiertos"):
+        console.print("[yellow]Ojo:[/] 'Supuestos abiertos' esta vacio. Eso no significa "
+                      "que no haya supuestos, significa que no se escribieron.\n")
+    t.spec_congelado = huella_spec(t)
+    escribir_ticket(t)
+    regenerar_indice()
+    console.print(f"[bold]{t.slug}[/] aprobado, huella {t.spec_congelado}")
+    console.print("[dim]Si los criterios o el fuera de alcance cambian de ahora en mas, "
+                  "`board` lo marca como spec-drift.[/]")
+
+
+@cli.command("open")
+@click.argument("slug")
+@click.option("--repo", required=True, help="El segundo repo que suma el ticket.")
+@click.option("--cuenta", type=click.Choice(list(CUENTAS)))
+@click.option("--rama", "rama_pedida", help="Nombre completo de la rama.")
+@click.option("--tipo", type=click.Choice(TIPOS_RAMA), default="feature", show_default=True)
+@click.option("--worktree/--sin-worktree", default=None,
+              help="Forzar o evitar el ritual de worktree del perfil.")
+@click.option("--no-lanzar", is_flag=True)
+@click.option("--forzar", is_flag=True)
+def open_cmd(slug: str, repo: str, cuenta: str | None, rama_pedida: str | None,
+             tipo: str, worktree: bool | None, no_lanzar: bool, forzar: bool) -> None:
+    """Suma un repo al ticket, con su propia sesion y cuenta. Exige spec aprobado."""
+    t = buscar_ticket(slug)
+    if not t.spec_congelado:
+        raise click.ClickException(
+            f"'{t.slug}' no tiene el spec aprobado.\n"
+            "Cruzar a un segundo repo con el requerimiento sin cerrar es como se "
+            f"multiplica una mala interpretacion. Corré `factoria aprobar {t.slug}`."
+        )
+    rp = ruta_repo(repo)
+    if not rp:
+        raise click.ClickException(f"no encuentro el repo '{repo}'.")
+    if t.entrada(rp.name):
+        raise click.ClickException(
+            f"'{t.slug}' ya tiene entrada para {rp.name}. "
+            f"`factoria resume {t.slug} --repo {rp.name}`"
+        )
+    pf = perfil(rp.name)
+    cta = cuenta or pf.get("cuenta") or "dfv"
+    base = pf.get("base") or base_de(rp) or ""
+    rama = rama_pedida or f"{tipo}/{t.slug}"
+    usar_wt = pf.get("worktree", False) if worktree is None else worktree
+
+    if usar_wt:
+        cwd = _ritual_worktree(rp, pf, rama, base)
+    else:
+        _resolver_rama(rp, base, git(rp, "rev-parse", "--abbrev-ref", "HEAD"),
+                       rama, t.slug, tipo, False)
+        cwd = str(rp)
+
+    sid = str(uuid.uuid4())
+    doc = crear_doc(rp.name, t.slug)
+    t.repos.append(RepoTicket(repo=rp.name, cuenta=cta, rama=rama, cwd=cwd,
+                              session_id=sid, doc=str(doc)))
+    escribir_ticket(t)
+    regenerar_indice()
+    console.print(f"[bold]{t.slug}[/] + {rp.name} ({cta})  rama {rama}")
+    console.print(f"  cwd     {cwd}")
+    console.print(f"  doc     {doc}")
+    console.print(f"  sesion  {sid}")
+    if no_lanzar:
+        console.print(f"[dim]Para abrirla: factoria resume {t.slug} --repo {rp.name}[/]")
+        return
+    _lanzar_en(cta, cwd, ["--session-id", sid], forzar, False, f"{rp.name} | {rama}")
+
+
+def _ritual_worktree(rp: Path, pf: dict, rama: str, base: str) -> str:
+    """El ritual de §10.1/§10.3: worktree, copias no versionadas y junctions.
+
+    Las junctions de node_modules y target existen porque reinstalar y recompilar
+    por worktree cuesta minutos; y son la razon de que `close` tenga que sacarlas
+    con rmdir ANTES del worktree remove.
+    """
+    raiz_wt = Path(pf.get("worktree_raiz") or (rp.parent / "wt"))
+    destino = raiz_wt / rama.rsplit("/", 1)[-1]
+    if destino.exists():
+        raise click.ClickException(f"ya existe {destino}.")
+    raiz_wt.mkdir(parents=True, exist_ok=True)
+    if existe_rama(rp, rama):
+        _git_o_falla(rp, "worktree", "add", str(destino), rama)
+    else:
+        _git_o_falla(rp, "worktree", "add", "-b", rama, str(destino), base)
+    console.print(f"[dim]worktree {destino}[/]")
+
+    for rel in (pf.get("copiar_al_worktree") or []):
+        o, d = rp / rel, destino / rel
+        if o.is_file():
+            d.parent.mkdir(parents=True, exist_ok=True)
+            d.write_bytes(o.read_bytes())
+            console.print(f"[dim]  copiado {rel}[/]")
+    for rel in (pf.get("skip_worktree") or []):
+        if (destino / rel).exists():
+            subprocess.run(["git", "-C", str(destino), "update-index",
+                            "--skip-worktree", rel], capture_output=True, text=True)
+            console.print(f"[dim]  skip-worktree {rel}[/]")
+    for rel in (pf.get("junctions") or []):
+        o, d = (rp / rel), (destino / rel)
+        if o.is_dir() and not d.exists():
+            d.parent.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(d), str(o)],
+                               capture_output=True, text=True)
+            console.print(f"[dim]  junction {rel}"
+                          + ("" if r.returncode == 0 else " [red]FALLO[/]") + "[/]")
+    return str(destino)
+
+
+@cli.command("close")
+@click.argument("slug")
+@click.option("--repo", help="Cerrar solo la entrada de un repo.")
+@click.option("--pushear/--sin-pushear", default=True, show_default=True)
+@click.option("--limpiar-worktree", is_flag=True,
+              help="Sacar junctions y el worktree. Irreversible sobre el directorio.")
+def close_cmd(slug: str, repo: str | None, pushear: bool, limpiar_worktree: bool) -> None:
+    """Cierra el ticket: pushea, archiva el cuerpo y deja listo el compare. NO crea el PR."""
+    t = buscar_ticket(slug)
+    entradas = [e for e in t.repos if not repo or repo.lower() in e.repo.lower()]
+    if not entradas:
+        raise click.ClickException(f"'{t.slug}' no tiene entrada para --repo {repo}.")
+
+    urls = []
+    for e in entradas:
+        rp = ruta_repo(e.repo)
+        if not rp:
+            console.print(f"[yellow]{e.repo}: no esta en disco, se saltea.[/]")
+            continue
+        trabajo = Path(e.cwd) if e.cwd and Path(e.cwd).is_dir() else rp
+        if (sucio := git(trabajo, "status", "--porcelain")):
+            raise click.ClickException(
+                f"{e.repo} tiene cambios sin commitear:\n{sucio[:300]}\n"
+                "Cerrá con el arbol limpio: si no, lo que quede afuera no se pushea."
+            )
+        base = perfil(e.repo).get("base") or base_de(rp) or ""
+        if pushear and e.rama:
+            r = subprocess.run(["git", "-C", str(trabajo), "push", "-u", "origin", e.rama],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace")
+            console.print(f"[dim]{e.repo}: push {'ok' if r.returncode == 0 else 'FALLO'}[/]")
+            if r.returncode != 0:
+                console.print(f"  [yellow]{(r.stderr or '').strip()[:200]}[/]")
+        if (u := url_compare(rp, base, e.rama)):
+            urls.append((e.repo, u))
+        if limpiar_worktree and e.cwd and Path(e.cwd) != rp and Path(e.cwd).exists():
+            _quitar_worktree(rp, Path(e.cwd))
+
+    # Archivar: el cuerpo va al historial y el ticket queda en una linea.
+    hist = DATOS / "historial" / f"{t.slug}.md"
+    hist.parent.mkdir(parents=True, exist_ok=True)
+    hist.write_text(
+        f"# {t.slug}\n\nCerrado {time.strftime('%Y-%m-%d')}. "
+        f"Fase final: {t.fase}. Issue: {t.issue_url or '-'}\n\n" + t.cuerpo.strip() + "\n",
+        encoding="utf-8", newline="\n")
+    decisiones = _seccion(t.cuerpo, "## Decisiones")
+    t.cuerpo = (f"# {t.slug}\n\n## Estado actual\n\nCerrado. El cuerpo completo esta en "
+                f"`historial/{t.slug}.md`.\n")
+    t.fase, t.abierto = "cerrado", False
+    escribir_ticket(t)
+    if t.proyecto_item:
+        try:
+            for h in espejar(t, config_github()):
+                console.print(f"  {h}")
+        except click.ClickException as exc:
+            console.print(f"  [yellow]espejo pendiente:[/] {exc.message}")
+    regenerar_indice()
+
+    console.print()
+    console.print(f"[bold]{t.slug}[/] cerrado. Historial en {hist}")
+    if decisiones:
+        console.print("[bold]Decisiones para pasar a ADR:[/]")
+        for l in decisiones.splitlines():
+            if l.strip():
+                console.print(f"  {l.strip()}")
+    if urls:
+        console.print("\n[bold]Para armar el PR a mano:[/]")
+        for r, u in urls:
+            console.print(f"  {r:<18} {u}")
+    console.print("\n[dim]factoria no crea el PR ni mergea: eso es tuyo y de los "
+                  "revisores.[/]")
+    console.print()
+
+
+def _quitar_worktree(rp: Path, wt: Path) -> None:
+    """Junctions primero, con rmdir. Al reves, el borrado recursivo del worktree
+    atraviesa el reparse point y se lleva el node_modules y el target del
+    checkout principal."""
+    for hijo in sorted(wt.rglob("*"), reverse=True):
+        if es_junction(hijo):
+            r = subprocess.run(["cmd", "/c", "rmdir", str(hijo)],
+                               capture_output=True, text=True)
+            console.print(f"[dim]  junction fuera: {hijo.name}"
+                          + ("" if r.returncode == 0 else " [red]FALLO[/]") + "[/]")
+    r = subprocess.run(["git", "-C", str(rp), "worktree", "remove", str(wt)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    console.print(f"[dim]  worktree remove: {'ok' if r.returncode == 0 else (r.stderr or '').strip()[:150]}[/]")
+
+
+# --------------------------------------------------------------------------
+# check + pre-push (paso 8)
+# --------------------------------------------------------------------------
+
+COLA_SALIDA = 20  # lineas de stdout que van al doc; el resto, a logs/
+
+
+@cli.command("check")
+@click.option("--slug", help="Escribir la evidencia en el doc de este ticket.")
+@click.option("--instalar-pre-push", is_flag=True,
+              help="Poblar el hooksPath del repo con un pre-push que corra esto.")
+def check_cmd(slug: str | None, instalar_pre_push: bool) -> None:
+    """Corre las verificaciones del perfil y las cotas. Sirve como pre-push."""
+    rp = repo_del_cwd()
+    if not rp:
+        raise click.ClickException("no estas dentro de un repo conocido.")
+    pf = perfil(rp.name)
+
+    if instalar_pre_push:
+        # NO se re-apunta core.hooksPath: en defeve ya esta seteado a .githooks
+        # y ese directorio esta VACIO, lo que tiene los hooks de git apagados.
+        # Re-apuntarlo hubiera dejado el problema intacto; hay que POBLARLO.
+        configurado = git(rp, "config", "core.hooksPath")
+        destino = (rp / configurado) if configurado else (rp / ".git" / "hooks")
+        destino.mkdir(parents=True, exist_ok=True)
+        h = destino / "pre-push"
+        h.write_text(
+            "#!/bin/sh\n"
+            "# Instalado por `factoria check --instalar-pre-push`.\n"
+            "exec factoria check\n",
+            encoding="utf-8", newline="\n")
+        os.chmod(h, 0o755)
+        console.print(f"[bold]pre-push instalado[/] en {h}")
+        if configurado:
+            console.print(f"[dim]core.hooksPath ya apuntaba a '{configurado}' y estaba "
+                          "vacio: por eso los hooks de git no corrian. Ahora si.[/]")
+        else:
+            console.print("[dim]core.hooksPath no estaba seteado; se uso .git/hooks.[/]")
+        return
+
+    fallas: list[str] = []
+    lineas_ev: list[str] = []
+
+    # 1. Archivos protegidos que nunca deben viajar.
+    for p in (pf.get("proteger_commit") or []):
+        r = subprocess.run(["git", "-C", str(rp), "log", "--oneline", "-1", "--", p],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        staged = subprocess.run(["git", "-C", str(rp), "diff", "--cached", "--name-only", "--", p],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if staged.stdout.strip():
+            fallas.append(f"{p} esta staged y no debe commitearse")
+        lineas_ev.append(f"- [{'x' if not staged.stdout.strip() else ' '}] `{p}` no staged")
+
+    # 2. Cotas del estandar. Es lo unico que hoy se puede verificar sin suite.
+    if (ca := cota_estado_actual(rp)):
+        linea, largo = ca
+        ok = largo <= COTA_ESTADO_ACTUAL
+        if not ok:
+            fallas.append(f"CLAUDE.md 'Estado de la Mision' tiene {largo} lineas "
+                          f"(cota {COTA_ESTADO_ACTUAL}), linea {linea}")
+        lineas_ev.append(f"- [{'x' if ok else ' '}] CLAUDE.md estado actual "
+                         f"{largo}/{COTA_ESTADO_ACTUAL} lineas")
+
+    # 3. Comandos declarados en el perfil. Hoy ninguno tiene: ver el aviso final.
+    for cmd in (pf.get("verify") or []):
+        r = subprocess.run(cmd, shell=True, cwd=str(rp), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
+        ok = r.returncode == 0
+        salida = (r.stdout or "") + (r.stderr or "")
+        cola = "\n".join(salida.splitlines()[-COLA_SALIDA:])
+        log = DATOS / "logs" / f"{rp.name}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(salida, encoding="utf-8", newline="\n")
+        if not ok:
+            fallas.append(f"`{cmd}` salio con {r.returncode}")
+        lineas_ev.append(f"- [{'x' if ok else ' '}] `{cmd}`\n```\n{cola}\n```\n"
+                         f"  log completo: `{log}`")
+
+    console.print()
+    for l in lineas_ev:
+        console.print("  " + l.splitlines()[0])
+    if not pf.get("verify"):
+        console.print("[yellow]Este perfil no declara comandos `verify:`[/], asi que esto "
+                      "solo verifico cotas y archivos protegidos.\n"
+                      f"[dim]Agregá en {DATOS / 'profiles' / (rp.name + '.yml')}:\n"
+                      "  verify:\n    - <el comando mas pobre que ya tengas: que compile, "
+                      "que levante>[/]")
+
+    if slug:
+        t = buscar_ticket(slug)
+        e = _entrada_unica(t, rp.name)
+        if e.doc and Path(e.doc).is_file():
+            bloque = (f"\n## Evidencia ({time.strftime('%Y-%m-%d %H:%M')})\n\n"
+                      + "\n".join(lineas_ev) + "\n")
+            with Path(e.doc).open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(bloque)
+            console.print(f"[dim]evidencia agregada a {e.doc}[/]")
+
+    if fallas:
+        console.print()
+        for f in fallas:
+            console.print(f"  [red]FALLA[/] {f}")
+        raise SystemExit(1)
+    console.print("\n[green]ok[/]\n")
 
 
 @cli.command("perfiles")
