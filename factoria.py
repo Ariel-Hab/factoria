@@ -679,6 +679,15 @@ def hallazgos(rel: Relevamiento) -> list[str]:
             + ", ".join(f"{t.slug} ({t.lineas})" for t in gordos[:3])
             + ". El handoff de fase va a .factoria/handoffs/, no adentro del ticket"
         )
+    # El espejo es opcional, pero su ausencia tiene que ser visible: un ticket
+    # sin issue no esta en el tablero y no hay ningun otro sintoma.
+    sin_espejo = [t for t in rel.tickets if t.abierto and not t.issue]
+    if sin_espejo:
+        h.append(
+            f"[yellow]espejo[/] {len(sin_espejo)} tickets abiertos sin issue: "
+            + ", ".join(t.slug for t in sin_espejo[:3])
+            + ". No estan en el tablero  ->  factoria espejo --todos"
+        )
     sin_ses = [(t, e) for t in rel.tickets if t.abierto
                for e in t.repos if not e.session_id]
     if sin_ses:
@@ -1665,6 +1674,7 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
 
     console.print()
     console.print(f"[bold]{slug}[/]  fase plan  |  {rp.name}  |  cuenta {cta}")
+    espejar_si_se_puede(t)
     console.print(f"  ticket   {destino}")
     console.print(f"  doc      {doc}")
     console.print(f"  sesion   {sid}")
@@ -1795,13 +1805,9 @@ def fase_cmd(slug: str, nueva: str) -> None:
     escribir_ticket(t)
     regenerar_indice()
     console.print(f"[bold]{t.slug}[/]  {previa} -> {nueva}")
-    # El espejo es opcional por diseño: si falla, el ticket ya quedo bien.
-    if t.proyecto_item:
-        try:
-            for h in espejar(t, config_github()):
-                console.print(f"  {h}")
-        except click.ClickException as exc:
-            console.print(f"  [yellow]espejo pendiente:[/] {exc.message}")
+    # Sin condicionar a `proyecto_item`: guardarlo para los ya espejados dejaba
+    # un ticket nunca espejado invisible para siempre, y en silencio.
+    espejar_si_se_puede(t)
     console.print(
         "[dim]La sesion sigue viva: cambiar de fase no la corta, porque reconstruir "
         "contexto cuesta mas que seguir.\n"
@@ -1953,6 +1959,26 @@ def cuerpo_issue(t: Ticket) -> str:
         cuerpo = _seccion(t.cuerpo, enc)
         partes += ["", enc.replace("## ", "### "), "", cuerpo or "_(vacío)_"]
     return "\n".join(partes)
+
+
+def espejar_si_se_puede(t: Ticket) -> None:
+    """Espeja y persiste los ids, sin abortar el comando que llamo.
+
+    El espejo es opcional por diseño: los .md son canonicos, asi que sin red o
+    sin `gh` el ticket ya quedo bien y esto solo se reporta. Lo que NO puede
+    pasar es perder un id: `espejar` puede crear el issue y despues fallar al
+    agregarlo al tablero, y si ese numero no se guarda el proximo intento crea
+    un issue duplicado. Por eso se escribe el ticket en las dos ramas.
+    """
+    try:
+        hechos = espejar(t, config_github())
+    except click.ClickException as exc:
+        escribir_ticket(t)
+        console.print(f"  [yellow]espejo pendiente:[/] {exc.message}")
+        return
+    escribir_ticket(t)
+    for h in hechos:
+        console.print(f"  {h}")
 
 
 def espejar(t: Ticket, cfg: dict) -> list[str]:
@@ -3068,12 +3094,7 @@ def close_cmd(slug: str, repo: str | None, pushear: bool, limpiar_worktree: bool
                 f"`historial/{t.slug}.md`.\n")
     t.fase, t.abierto = "cerrado", False
     escribir_ticket(t)
-    if t.proyecto_item:
-        try:
-            for h in espejar(t, config_github()):
-                console.print(f"  {h}")
-        except click.ClickException as exc:
-            console.print(f"  [yellow]espejo pendiente:[/] {exc.message}")
+    espejar_si_se_puede(t)
     regenerar_indice()
 
     console.print()
