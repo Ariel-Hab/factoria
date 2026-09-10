@@ -103,51 +103,67 @@ flowchart LR
     AD --> R
     R --> W{"¿pesa más<br/>de 1 MB?"}
     W -->|no| GO(["seguir"])
-    W -->|sí| CU["<b>cortar --fork</b><br/>+ <b>contexto</b>"]
+    W -->|sí| CU["<b>cortar --fork</b><br/>o <b>resume --nueva</b>"]
     CU --> GO
     style R fill:#238636,color:#fff
     style CU fill:#bf8700,color:#fff
 ```
 
 ```bash
-factoria resume <slug>          # sin argumentos, lista lo que hay en vuelo
-factoria adoptar <slug>         # registra la sesión que hizo el trabajo de verdad
-factoria cortar <slug> --fork   # corta cuando pesa, preservando la anterior
-factoria contexto <slug>        # el pack mínimo para arrancar fresco: ticket + vecinos
+factoria resume <slug>              # sin argumentos, lista lo que hay en vuelo
+factoria resume <slug> --nueva      # sesión NUEVA con el pack, registrada en el ticket
+factoria adoptar <slug>             # registra la sesión que hizo el trabajo de verdad
+factoria cortar <slug> --fork       # ramifica cuando pesa, preservando la anterior
+factoria contexto <slug>            # el pack mínimo: ticket + doc de trabajo + vecinos
 ```
 
 ### Cambiar de cuenta
 
 **Las cuentas `dfv` y `personal` son transcripts disjuntos** (dos directorios
 distintos, 0 uuid en común sobre 337): una sesión **no se puede reanudar desde
-la otra cuenta**. Lo que se muda no es la conversación — es a qué sesión y a
-qué cuenta apunta el ticket. El trabajo entra en la sesión nueva por `contexto`.
+la otra cuenta**. Pero el trabajo sí se muda, y es un solo comando:
+
+```bash
+factoria resume <slug> --nueva --cuenta dfv
+```
 
 ```mermaid
 flowchart LR
-    T["ticket<br/><i>cuenta: personal</i>"] -.->|"la charla NO se muda"| X(("✗"))
-    T --> A["abrís una sesión<br/>en la otra cuenta"]
-    A --> B["<b>adoptar slug --aqui</b><br/><i>el ticket pasa a ser de ésta</i>"]
-    B --> C["<b>contexto slug</b><br/><i>el trabajo entra acá</i>"]
-    style B fill:#238636,color:#fff
-    style C fill:#1f6feb,color:#fff
+    T["ticket<br/><i>cuenta: personal</i>"] --> N["<b>resume slug --nueva<br/>--cuenta dfv</b>"]
+    N --> S["sesión nueva en dfv<br/><i>arranca leyendo el pack</i>"]
+    N --> R["el ticket queda<br/>apuntando a ésta"]
+    T -.->|"la conversación<br/>NO se muda"| X(("✗"))
+    style N fill:#238636,color:#fff
+    style S fill:#1f6feb,color:#fff
     style X fill:#6e7681,color:#fff
 ```
 
+Hace las tres cosas juntas: abre la sesión en la cuenta que le pidas, le pasa el
+pack de `contexto` como **primer prompt**, y la deja **registrada en el ticket**
+— así el `resume` siguiente ya cae ahí. La anterior queda intacta, y `adoptar`
+la vuelve a encontrar cuando la necesites.
+
+Si al final no se lanza nada — por ejemplo porque estás adentro de otra sesión —
+**el registro se revierte**. Un uuid escrito que nadie va a abrir es justo el
+fantasma que `adoptar` viene a arreglar.
+
 | Quiero… | Comando |
 |---|---|
+| **seguir el ticket en la otra cuenta** | `resume <slug> --nueva --cuenta dfv` |
 | la sesión que ya existe, en su cuenta | `resume <slug> --repo R` |
-| **seguir el ticket acá, en esta sesión** | `adoptar <slug> --aqui` y después `contexto <slug>` |
+| cortar porque se puso cara | `cortar <slug>` (limpia, con pack) o `--fork` (ramifica) |
 | arreglar "el ticket apunta a un uuid fantasma" | `adoptar <slug>` |
-| una entrada nueva, con su propia sesión | `open <slug> --repo R --cuenta personal` |
-| el trabajo, no la conversación | `contexto <slug>` y sesión fresca donde sea |
+| registrar la sesión en la que ya estoy sentado | `adoptar <slug> --aqui` |
+| una entrada nueva para un 2º repo | `open <slug> --repo R2 --cuenta personal` |
 
 `adoptar` **sin uuid busca por evidencia**: la sesión cuyo transcript nombra el
 slug, en las dos cuentas, y le repunta también la cuenta. Si ninguna lo nombra
 se niega y lista las candidatas, en vez de tomar "la más reciente con el mismo
 `cwd`" — ese `cwd` lo comparten 6 sesiones de temas distintos, así que esa
-heurística elige conversaciones ajenas. `--aqui` es el caso sin adivinanza: la
-sesión desde la que se corre el comando, que Claude Code expone en el entorno.
+heurística elige conversaciones ajenas.
+
+La diferencia entre los dos: **`--nueva` abre la sesión**, `--aqui` registra una
+que ya está abierta y en la que estás trabajando.
 
 ## El tablero de GitHub
 

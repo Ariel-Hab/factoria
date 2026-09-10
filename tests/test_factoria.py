@@ -282,3 +282,69 @@ def test_adoptar_avisa_pero_no_falla_si_la_sesion_es_de_otro_ticket():
     assert "raise" not in cuerpo[j:cuerpo.index("previa, cuenta_previa", j)]
     # y el no-op tiene que resolverse ANTES del aviso
     assert cuerpo.index("ya apunta a") < j
+
+
+# --------------------------------------------------------------------------
+# resume --nueva: sesion nueva registrada, con el pack inyectado
+# --------------------------------------------------------------------------
+
+def _fresca(monkeypatch, tmp_path, lanzo, imprimir=False):
+    t = fx.Ticket(slug="mi-slug",
+                  repos=[fx.RepoTicket(repo="defeve", cuenta="personal",
+                                       cwd=CWD, session_id="vieja")])
+    monkeypatch.setattr(fx, "CONTEXTOS", tmp_path / "contexto")
+    monkeypatch.setattr(fx, "pack_de_contexto", lambda _s: "# pack")
+    monkeypatch.setattr(fx, "escribir_ticket", lambda _t: None)
+    vistos = []
+
+    def falso_lanzar(cta, cwd, args, forzar, impr, nota=""):
+        vistos.append((cta, cwd, args))
+        return lanzo
+
+    monkeypatch.setattr(fx, "_lanzar_en", falso_lanzar)
+    fx._arrancar_fresca(t, t.repos[0], "dfv", imprimir, False)
+    return t.repos[0], vistos
+
+
+def test_sesion_fresca_queda_registrada_y_recibe_el_pack(monkeypatch, tmp_path):
+    e, vistos = _fresca(monkeypatch, tmp_path, lanzo=True)
+    assert e.cuenta == "dfv"                    # la cuenta pedida, no la del ticket
+    assert e.session_id not in ("", "vieja")
+    cta, _cwd, args = vistos[0]
+    assert cta == "dfv"
+    assert args[:2] == ["--session-id", e.session_id]
+    # el prompt inicial va como UN argumento, con el slug y la ruta del pack
+    assert len(args) == 3 and "mi-slug" in args[2]
+
+
+def test_sesion_fresca_se_revierte_si_no_se_lanzo(monkeypatch, tmp_path):
+    """Adentro de otra sesion `_lanzar_en` imprime la receta y no lanza. Dejar
+    el uuid escrito ahi seria el fantasma que `adoptar` viene a arreglar."""
+    e, _ = _fresca(monkeypatch, tmp_path, lanzo=False)
+    assert (e.session_id, e.cuenta) == ("vieja", "personal")
+
+
+def test_sesion_fresca_con_imprimir_no_toca_el_ticket(monkeypatch, tmp_path):
+    e, vistos = _fresca(monkeypatch, tmp_path, lanzo=False, imprimir=True)
+    assert (e.session_id, e.cuenta) == ("vieja", "personal")
+    assert vistos, "igual tiene que mostrar la receta"
+
+
+def test_lanzar_avisa_cuando_no_lanzo():
+    """Quien registra un uuid antes de lanzar necesita saber si se lanzo."""
+    assert fx._lanzar_en("dfv", CWD, ["-r", "x"], False, True) is False
+
+
+def test_el_pack_de_contexto_es_reutilizable_como_funcion():
+    """`resume --nueva` lo inyecta como primer prompt: no alcanza con imprimirlo."""
+    import inspect
+    assert callable(fx.pack_de_contexto)
+    # el decorador de click envuelve la funcion: la real es .callback
+    assert "pack_de_contexto" in inspect.getsource(fx.contexto_cmd.callback)
+
+
+def test_resume_sin_nueva_apunta_a_nueva_cuando_la_cuenta_no_tiene_sesion():
+    """El error tiene que llevar a algun lado: era un callejon sin salida."""
+    fuente = FUENTE.read_text(encoding="utf-8")
+    i = fuente.index("no tiene entrada para esos filtros")
+    assert "--nueva --cuenta" in fuente[i:i + 700]

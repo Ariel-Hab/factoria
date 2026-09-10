@@ -35,6 +35,8 @@ from rich.table import Table
 ARIEL = Path(r"C:\ariel")
 DATOS = ARIEL / ".factoria"
 CONTRATOS = ARIEL / "dfv" / ".contracts"
+# Derivado: lo reescribe cada sesion fresca. Ignorado en el repo de datos.
+CONTEXTOS = DATOS / "contexto"
 RAICES = [ARIEL / "dfv", ARIEL / "integhra"]
 # gstack es un template de terceros; skills/~ es un directorio espurio.
 # `factoria` NO se ignora: la herramienta se trackea con la herramienta, y
@@ -917,15 +919,22 @@ def _render_sesiones(ss: list[Sesion], encabezado: str = "") -> None:
 
 
 def _lanzar_en(cuenta: str, cwd: str, args: list[str], forzar: bool, imprimir: bool,
-               nota: str = "") -> None:
-    """Arranca claude con el CLAUDE_CONFIG_DIR de la cuenta y el cwd dados."""
+               nota: str = "") -> bool:
+    """Arranca claude con el CLAUDE_CONFIG_DIR de la cuenta y el cwd dados.
+
+    Devuelve si de verdad lanzo algo: con `--imprimir` o adentro de otra sesion
+    no lanza, y quien registro un uuid antes de llamar necesita saberlo para no
+    dejar el ticket apuntando a una sesion que nunca se abrio.
+    """
     config_dir = CUENTAS[cuenta]
+    # list2cmdline y no un join: uno de los args puede ser el prompt inicial,
+    # que lleva espacios y comillas.
     receta = (f"set CLAUDE_CONFIG_DIR={config_dir}\n"
               f"cd /d {cwd}\n"
-              f'claude {" ".join(args)}')
+              f"claude {subprocess.list2cmdline(args)}")
     if imprimir:
         console.print(receta)
-        return
+        return False
     if not cwd or not Path(cwd).is_dir():
         raise click.ClickException(
             f"el cwd registrado no existe: {cwd or '(vacio)'}\n"
@@ -938,7 +947,7 @@ def _lanzar_en(cuenta: str, cwd: str, args: list[str], forzar: bool, imprimir: b
         )
         console.print(receta)
         console.print("\n[dim](o --forzar si de verdad querias anidarla)[/]")
-        return
+        return False
     binario = shutil.which("claude")
     if not binario:
         raise click.ClickException("no encuentro `claude` en el PATH.")
@@ -946,6 +955,7 @@ def _lanzar_en(cuenta: str, cwd: str, args: list[str], forzar: bool, imprimir: b
     entorno["CLAUDE_CONFIG_DIR"] = str(config_dir)
     console.print(f"[dim]{cuenta} | {cwd}{' | ' + nota if nota else ''}[/]")
     subprocess.run([binario, *args], cwd=cwd, env=entorno)
+    return True
 
 
 def _elegir_una(ss: list[Sesion], consulta: str, elegir: int | None,
@@ -1060,6 +1070,10 @@ class Destino:
     existe: bool = True   # el .jsonl ya esta en disco
     mb: float = 0.0
     origen: str = "sesion"
+    # Cuando el destino salio de un ticket, quien lo resolvio ya lo tiene: sin
+    # esto `cortar` tenia que volver a parsear `origen` para encontrarlo.
+    ticket: Ticket | None = None
+    entrada: RepoTicket | None = None
 
 
 def jsonl_de(session_id: str, cuenta: str) -> Path | None:
@@ -1138,6 +1152,10 @@ def resolver_destino(consulta: str, repo: str | None, cuenta: str | None,
             raise click.ClickException(
                 f"el ticket '{t.slug}' no tiene entrada para esos filtros. Repos: "
                 + ", ".join(f"{e.repo}({e.cuenta})" for e in t.repos)
+                + (f"\nLos transcripts de las dos cuentas son disjuntos, asi que en "
+                   f"{cuenta} no hay conversacion que continuar. Para trabajarlo ahi:"
+                   f"\n  factoria resume {t.slug} --nueva --cuenta {cuenta}"
+                   if cuenta else "")
             )
         if len(entradas) > 1:
             raise click.ClickException(
@@ -1152,6 +1170,7 @@ def resolver_destino(consulta: str, repo: str | None, cuenta: str | None,
             existe=j is not None,
             mb=(j.stat().st_size / 1_048_576) if j else 0.0,
             origen=f"ticket {t.slug}",
+            ticket=t, entrada=e,
         )
     ss = buscar_sesiones(consulta, cuenta, dias or None)
     if repo:
@@ -1161,17 +1180,82 @@ def resolver_destino(consulta: str, repo: str | None, cuenta: str | None,
                    nota=s.rama or "(sin rama)", existe=True, mb=s.mb)
 
 
+def _arrancar_fresca(t: Ticket, e: RepoTicket, cuenta: str,
+                     imprimir: bool, forzar: bool) -> None:
+    """Sesion nueva para un ticket que ya existe: la registra y le pasa el pack.
+
+    Es lo que faltaba para que "seguir este ticket en la otra cuenta" sea un
+    comando y no un ritual de tres pasos. Dos cosas que no puede saltear:
+    registrar el uuid ANTES de lanzar, porque si no la sesion nace huerfana y
+    `resume` vuelve a abrir cualquier cosa; y pasarle el pack de contexto,
+    porque una sesion fresca no sabe nada del ticket.
+
+    Si al final no se lanzo nada, el registro se revierte: dejar escrito un uuid
+    que nadie va a abrir es exactamente el fantasma que `adoptar` viene a
+    arreglar.
+    """
+    nuevo = str(uuid.uuid4())
+    previa, cuenta_previa = e.session_id, e.cuenta
+    CONTEXTOS.mkdir(parents=True, exist_ok=True)
+    pack = CONTEXTOS / f"{t.slug}.md"
+    pack.write_text(pack_de_contexto(t.slug), encoding="utf-8")
+    prompt = (f"Retomas el ticket {t.slug}. Antes que nada lee {pack}: es el pack "
+              "de contexto que armo factoria, con el ticket, el estado de su doc "
+              "de trabajo y sus vecinos. Despues deci en que estado esta y cual "
+              "es el proximo paso, sin tocar nada todavia.")
+    args = ["--session-id", nuevo, prompt]
+    nota = f"{e.repo} | {e.rama or '(sin rama)'} | fase {t.fase}"
+    console.print(f"[bold]{t.slug}/{e.repo}[/]  sesion nueva {nuevo} [dim]({cuenta})[/]")
+    console.print(f"  [dim]pack: {pack}[/]")
+    if previa:
+        console.print(
+            f"  [dim]la anterior ({previa}, cuenta {cuenta_previa}) queda intacta "
+            f"pero sin ticket que la apunte. `factoria adoptar {t.slug} --cuenta "
+            f"{cuenta_previa}` la vuelve a encontrar: nombra el slug.[/]")
+    if imprimir:
+        _lanzar_en(cuenta, e.cwd, args, forzar, True, nota)
+        console.print("  [dim]--imprimir: el ticket quedo intacto.[/]")
+        return
+    e.session_id, e.cuenta = nuevo, cuenta
+    escribir_ticket(t)
+    try:
+        lanzo = _lanzar_en(cuenta, e.cwd, args, forzar, False, nota)
+    except Exception:
+        e.session_id, e.cuenta = previa, cuenta_previa
+        escribir_ticket(t)
+        raise
+    if not lanzo:
+        e.session_id, e.cuenta = previa, cuenta_previa
+        escribir_ticket(t)
+        console.print("  [dim]no se lanzo nada, asi que el ticket volvio a apuntar "
+                      f"a {previa or '(ninguna)'}.[/]")
+
+
 @cli.command()
 @click.argument("consulta")
 @click.option("--repo", help="Cuando el ticket tiene sesiones en varios repos.")
 @click.option("--cuenta", type=click.Choice(list(CUENTAS)), help="Acotar a una cuenta.")
 @click.option("--elegir", type=int, help="Indice de la lista cuando matchean varias.")
 @click.option("--dias", default=0, help="Solo sesiones de hace <= N dias. 0 = todas.")
+@click.option("--nueva", is_flag=True,
+              help="No continuar: abrir una sesion NUEVA con el pack de contexto "
+                   "del ticket y registrarla. Con --cuenta, en esa cuenta.")
 @click.option("--imprimir", is_flag=True, help="Mostrar el comando sin ejecutarlo.")
 @click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
 def resume(consulta: str, repo: str | None, cuenta: str | None, elegir: int | None,
-           dias: int, imprimir: bool, forzar: bool) -> None:
-    """Reanuda la sesion de una tarea: continua la conversacion, no abre otra."""
+           dias: int, nueva: bool, imprimir: bool, forzar: bool) -> None:
+    """Reanuda la sesion de una tarea: continua la conversacion, no abre otra.
+
+    `--nueva` es el caso en que no hay conversacion que continuar: el ticket
+    vive en la otra cuenta (los transcripts son disjuntos), o la sesion se puso
+    cara. Abre una sesion nueva en la cuenta que se pida, le pasa el pack de
+    `contexto` como primer prompt y la deja registrada en el ticket.
+    """
+    if nueva:
+        tk = buscar_ticket(consulta)
+        _arrancar_fresca(tk, _entrada_unica(tk, repo), cuenta or _entrada_unica(
+            tk, repo).cuenta, imprimir, forzar)
+        return
     d = resolver_destino(consulta, repo, cuenta, elegir, dias, "resume")
     if not d.existe:
         # Ticket recien creado con --no-lanzar: el id esta reservado pero el
@@ -1183,7 +1267,9 @@ def resume(consulta: str, repo: str | None, cuenta: str | None, elegir: int | No
         console.print(
             f"[yellow]Ojo:[/] esta sesion pesa {d.mb:.1f} MB (umbral {UMBRAL_SESION_MB}). "
             "Cada turno paga lectura de cache sobre todo ese prefijo.\n"
-            f"[dim]Alternativa: factoria cortar {consulta} --fork[/]\n"
+            f"[dim]Alternativas: factoria cortar {consulta} --fork  (ramifica, "
+            f"conserva el contexto)\n             factoria resume {consulta} --nueva  (limpia, con el pack del "
+            f"ticket)[/]\n"
         )
     _lanzar_en(d.cuenta, d.cwd, ["-r", d.session_id], forzar, imprimir, d.nota)
 
@@ -1210,11 +1296,15 @@ def cortar(consulta: str, fork: bool, repo: str | None, cuenta: str | None,
         _lanzar_en(d.cuenta, d.cwd, ["-r", d.session_id, "--fork-session"],
                    forzar, imprimir, d.nota)
         return
+    if d.ticket and d.entrada:
+        _arrancar_fresca(d.ticket, d.entrada, d.cuenta, imprimir, forzar)
+        return
+    # Sin ticket detras no hay pack que armar ni donde registrar el uuid: el
+    # destino salio de la busqueda por texto sobre las sesiones.
     console.print(
         f"[yellow]Sesion nueva y limpia[/] en {d.cwd} ({d.cuenta}) | {d.nota}\n"
-        f"[dim]La anterior queda intacta: factoria resume {consulta}[/]\n"
-        "[dim]El pack de contexto automatico (`factoria contexto`) llega en el paso 6; "
-        "por ahora la sesion arranca solo con el CLAUDE.md del repo.[/]\n"
+        f"[dim]La anterior queda intacta. Sin ticket detras arranca solo con el "
+        "CLAUDE.md del repo: si querias el pack, corrilo por slug de ticket.[/]\n"
     )
     _lanzar_en(d.cuenta, d.cwd, [], forzar, imprimir, d.nota)
 
@@ -2803,6 +2893,12 @@ def grafo_cmd(que_toca: str | None, vecinos: str | None, bloqueos: bool,
               help="Cuantos vecinos incluir.")
 def contexto_cmd(slug: str, max_vecinos: int) -> None:
     """El pack minimo para arrancar una sesion: el ticket y el estado de sus vecinos."""
+    click.echo(pack_de_contexto(slug, max_vecinos))
+
+
+def pack_de_contexto(slug: str, max_vecinos: int = 4) -> str:
+    """El texto del pack. Aparte del comando porque `resume --nueva` lo inyecta
+    como primer prompt de la sesion que abre, no solo lo imprime."""
     g = grafo_vigente()
     cands = [n for n in resolver_nodo(g, slug) if n.startswith(("ticket:", "doc:"))]
     if not cands:
@@ -2867,7 +2963,7 @@ def contexto_cmd(slug: str, max_vecinos: int) -> None:
     if contratos:
         partes += ["---", "", "## Contratos que toca", ""]
         partes += [f"- `.contracts\\{c.split(':', 1)[-1]}.md`" for c in contratos]
-    click.echo("\n".join(partes))
+    return "\n".join(partes)
 
 
 # --------------------------------------------------------------------------
