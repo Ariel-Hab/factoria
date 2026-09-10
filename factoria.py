@@ -3146,9 +3146,16 @@ def _pasos_manuales(slug: str, rp: Path, trabajo: Path, e: RepoTicket, base: str
         return []
     # Nunca proponer borrar la base ni una rama protegida: seria el peor consejo
     # posible, y pasa de verdad porque `new --aqui` registra la rama actual.
-    prohibidas = set(perfil(e.repo).get("ramas_prohibidas") or ()) | {base}
-    borrable = rama not in prohibidas
     pasos = []
+    if rama == base:
+        # `new --aqui` registra la rama actual, que puede ser la base. Ahi no hay
+        # PR (comparar una rama contra si misma no dice nada) ni rama que borrar.
+        pasos.append(f"git -C {trabajo} push origin {rama}" if not pusheada else
+                     f"[dim]el trabajo esta en '{rama}' y ya pusheado: no hay PR "
+                     "ni rama que borrar.[/]")
+        return pasos
+    prohibidas = set(perfil(e.repo).get("ramas_prohibidas") or ())
+    borrable = rama not in prohibidas
     if not pusheada:
         pasos.append(f"git -C {trabajo} push -u origin {rama}")
     if (u := url_compare(rp, base, rama)):
