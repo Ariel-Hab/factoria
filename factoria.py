@@ -114,6 +114,22 @@ class Rama:
     nombre: str
     dias: int
     pusheada: bool
+    # Rama de integracion intermedia que ya la contiene, si hay alguna. En
+    # defeve, 34 de las 55 "sin mergear a master" ya estan en desarrollo-ari:
+    # no son 55 puntas sueltas, son 34 esperando un solo merge mas 21 sueltas.
+    integrada_en: str = ""
+
+
+# Ramas de integracion intermedias: en defeve las features salen de
+# `desarrollo-ari` y se integran ahi antes de llegar a master.
+BASES_CANDIDATAS = ("desarrollo-ari", "develop", "dev")
+
+
+def _es_ancestro(repo: Path, rama: str, posible_padre: str) -> bool:
+    r = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", rama, posible_padre],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return r.returncode == 0
 
 
 def ramas_sin_mergear(repo: Path, base: str) -> list[Rama]:
@@ -135,6 +151,9 @@ def ramas_sin_mergear(repo: Path, base: str) -> list[Rama]:
         for r in git(repo, "for-each-ref", "--format=%(refname:short)", "refs/remotes").splitlines()
         if "/" in r
     }
+    ramas_locales = set(
+        git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
+    )
     ahora = time.time()
     out = []
     for linea in git(
@@ -150,7 +169,13 @@ def ramas_sin_mergear(repo: Path, base: str) -> list[Rama]:
         ts = partes[1] if len(partes) > 1 else ""
         upstream = partes[2] if len(partes) > 2 else ""
         dias = int((ahora - int(ts)) // 86400) if ts.isdigit() else 0
-        out.append(Rama(repo.name, nombre, dias, bool(upstream) or nombre in remotas))
+        integrada = ""
+        for cand in BASES_CANDIDATAS:
+            if cand != nombre and cand in ramas_locales and _es_ancestro(repo, nombre, cand):
+                integrada = cand
+                break
+        out.append(Rama(repo.name, nombre, dias, bool(upstream) or nombre in remotas,
+                        integrada))
     return sorted(out, key=lambda r: -r.dias)
 
 
@@ -551,6 +576,19 @@ def hallazgos(rel: Relevamiento) -> list[str]:
             f"'{rel.bases.get(repo, '?')}', la mas vieja de {vieja.dias}d "
             f"({vieja.nombre}); [red]{npush} nunca pusheadas[/]"
         )
+        # No son N puntas sueltas si la mayoria ya paso por la rama intermedia:
+        # esas esperan UN merge, no N. La distincion cambia por donde empezar.
+        integradas = [r for r in ramas if r.integrada_en]
+        if integradas:
+            porintermedia: dict[str, int] = {}
+            for r in integradas:
+                porintermedia[r.integrada_en] = porintermedia.get(r.integrada_en, 0) + 1
+            detalle = ", ".join(f"{n} ya en '{k}'" for k, n in porintermedia.items())
+            h.append(
+                f"  [dim]de esas, {detalle}: esperan un solo merge de la intermedia, "
+                f"no {len(ramas)}. Sueltas de verdad: "
+                f"{len(ramas) - len(integradas)}[/]"
+            )
 
     for wt in rel.worktrees:
         if (p := wt.problema(rel.bases.get(wt.repo, ""))):
@@ -639,6 +677,24 @@ def hallazgos(rel: Relevamiento) -> list[str]:
             ".jsonl en disco (nunca abiertas, o borradas): "
             + ", ".join(f"{t.slug}/{e.repo}" for t, e in huerfanas[:3])
         )
+    # Hotspots: un archivo que tocan muchas ramas sin mergear es conflicto
+    # garantizado el dia que se integren. Sale del grafo si esta construido; no
+    # se reconstruye aca porque cuesta 10 s.
+    g = cargar_json(path_grafo())
+    if isinstance(g, dict) and g.get("aristas"):
+        cuenta: dict[str, int] = {}
+        for ar in g["aristas"]:
+            if ar["t"] == "toca" and ar["d"].startswith("archivo:"):
+                cuenta[ar["d"]] = cuenta.get(ar["d"], 0) + 1
+        top = sorted(cuenta.items(), key=lambda kv: -kv[1])[:3]
+        if top and top[0][1] >= 5:
+            h.append(
+                f"[yellow]conflicto[/] {sum(1 for v in cuenta.values() if v >= 5)} archivos "
+                "los tocan 5+ trabajos sin mergear: "
+                + ", ".join(f"{Path(n.split('/', 1)[-1]).name} ({v})" for n, v in top)
+                + "  ->  factoria grafo --que-toca <archivo>"
+            )
+
     sin_espejo = [t for t in rel.tickets if t.abierto and not t.issue]
     if sin_espejo and (DATOS / "github.yml").is_file():
         h.append(
@@ -1943,6 +1999,308 @@ def renombrar_cmd(slug: str, nuevo: str, con_rama: bool) -> None:
         console.print(f"  {h}")
     console.print("[dim]La sesion no cambia: el session_id sigue siendo el mismo, "
                   f"asi que `factoria resume {nuevo}` cae en la misma conversacion.[/]")
+
+
+# --------------------------------------------------------------------------
+# Grafo: recuperacion por adyacencia (paso 6). NO es una base de datos: es un
+# derivado regenerable de metadata que ya escribis. El anti-patron de "cero RAG
+# de codigo" sigue en pie porque no hay embeddings de nada.
+# --------------------------------------------------------------------------
+
+RE_REF_CONTRATO = re.compile(r"\.contracts[\\/]([a-z0-9][a-z0-9._-]*?)\.md", re.I)
+# Los contratos ya traen items cross-repo reales: `- [ ] **(defeve → Cotizaciones)**`
+RE_BLOQUEO = re.compile(r"\((\w[\w.-]*)\s*(?:->|→|=>)\s*(\w[\w.-]*)\)")
+
+
+def path_grafo() -> Path:
+    return DATOS / "grafo.json"
+
+
+def _tokens(s: str) -> set[str]:
+    return set(re.split(r"[-_/.]+", s.lower())) - {""}
+
+
+def base_efectiva(rp: Path, rama: str, base_repo: str) -> str:
+    """De que rama salio esta, en serio: el ancestro comun mas reciente."""
+    candidatas = [base_repo, *BASES_CANDIDATAS]
+    mejor, mejor_ts = base_repo, -1
+    for c in candidatas:
+        if not c or c == rama or not existe_rama(rp, c):
+            continue
+        mb = git(rp, "merge-base", c, rama)
+        if not mb:
+            continue
+        ts = git(rp, "show", "-s", "--format=%ct", mb)
+        if ts.isdigit() and int(ts) > mejor_ts:
+            mejor, mejor_ts = c, int(ts)
+    return mejor
+
+
+def archivos_de_rama(rp: Path, rama: str, base: str, cache: dict) -> list[str]:
+    """Archivos que la rama cambio contra su base real, con cache por sha del tip.
+
+    Un diff cuesta ~0.55 s y hay ~60 ramas con doc asociado: sin cache el grafo
+    tardaria medio minuto en cada corrida.
+    """
+    if not rama or not base or rama == base:
+        return []
+    clave = f"{rp.name}/{rama}"
+    sha = git(rp, "rev-parse", "--verify", "--quiet", f"refs/heads/{rama}")
+    if not sha:
+        return []
+    guardado = cache.get(clave)
+    if guardado and guardado.get("sha") == sha:
+        return guardado["archivos"]
+    real = base_efectiva(rp, rama, base)
+    salida = git(rp, "diff", "--name-only", f"{real}...{rama}")
+    archivos = [l for l in salida.splitlines() if l.strip()]
+    cache[clave] = {"sha": sha, "base": real, "archivos": archivos}
+    return archivos
+
+
+def construir_grafo(reconstruir: bool = False) -> dict:
+    viejo = {} if reconstruir else (cargar_json(path_grafo()) or {})
+    cache = viejo.get("cache_ramas", {}) if isinstance(viejo, dict) else {}
+    nodos: dict[str, dict] = {}
+    aristas: list[dict] = []
+
+    def nodo(nid: str, **datos) -> str:
+        nodos.setdefault(nid, {}).update({k: v for k, v in datos.items() if v not in (None, "")})
+        return nid
+
+    def arista(o: str, d: str, t: str) -> None:
+        aristas.append({"o": o, "d": d, "t": t})
+
+    repos = {r.name: r for r in descubrir_repos()}
+    bases = {n: (perfil(n).get("base") or base_de(r) or "") for n, r in repos.items()}
+
+    # --- contratos: nodos + los bloqueos cross-repo que ya tienen escritos
+    for nombre, largo in cotas_contratos():
+        tema = nombre[:-3]
+        cid = nodo(f"contrato:{tema}", tipo="contrato", lineas=largo)
+        try:
+            txt = (CONTRATOS / nombre).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for linea in txt.splitlines():
+            if not linea.lstrip().startswith("- [ ]"):
+                continue
+            for a, b in RE_BLOQUEO.findall(linea):
+                if a in repos and b in repos:
+                    arista(nodo(f"repo:{a}", tipo="repo"), nodo(f"repo:{b}", tipo="repo"),
+                           "bloquea")
+                    arista(cid, nodo(f"repo:{b}", tipo="repo"), "bloquea")
+
+    def enlazar_trabajo(nid: str, repo_nombre: str, rama: str, texto: str) -> None:
+        """Aristas comunes a un ticket y a un doc de trabajo."""
+        rp = repos.get(repo_nombre)
+        arista(nid, nodo(f"repo:{repo_nombre}", tipo="repo"), "toca")
+        for tema in {t.lower() for t in RE_REF_CONTRATO.findall(texto or "")}:
+            arista(nid, nodo(f"contrato:{tema}", tipo="contrato"), "refiere")
+        if rp and rama:
+            for f in archivos_de_rama(rp, rama, bases.get(repo_nombre, ""), cache):
+                arista(nid, nodo(f"archivo:{repo_nombre}/{f}", tipo="archivo",
+                                 repo=repo_nombre, path=f), "toca")
+
+    # --- tickets
+    for t in tickets_todos():
+        tid = nodo(f"ticket:{t.slug}", tipo="ticket", fase=t.fase, abierto=t.abierto,
+                   issue=t.issue or None, path=str(t.path) if t.path else "")
+        for e in t.repos:
+            texto = t.cuerpo
+            if e.doc and Path(e.doc).is_file():
+                texto += Path(e.doc).read_text(encoding="utf-8", errors="replace")
+            enlazar_trabajo(tid, e.repo, e.rama, texto)
+
+    # --- docs de trabajo preexistentes: son 125 contra 1 ticket, asi que sin
+    # ellos el grafo no responderia nada util todavia. La rama se deduce por
+    # tokens del slug, que es como las nombras.
+    for nombre, rp in repos.items():
+        ramas = git(rp, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
+        por_tokens = {r: _tokens(r) for r in ramas if r.strip()}
+        for d in docs_de(rp):
+            did = nodo(f"doc:{nombre}/{d.slug}", tipo="doc", repo=nombre, estado=d.estado,
+                       pendientes=d.pendientes, lineas=d.lineas, path=str(d.path))
+            ds = _tokens(d.slug)
+            rama = next((r for r, tk in por_tokens.items() if ds <= tk or tk <= ds), "")
+            if rama:
+                arista(did, nodo(f"rama:{nombre}/{rama}", tipo="rama"), "deriva_de")
+            try:
+                texto = d.path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                texto = ""
+            enlazar_trabajo(did, nombre, rama, texto)
+
+    g = {"generado": time.strftime("%Y-%m-%dT%H:%M:%S"), "cache_ramas": cache,
+         "nodos": nodos, "aristas": aristas}
+    path_grafo().parent.mkdir(parents=True, exist_ok=True)
+    path_grafo().write_text(json.dumps(g, indent=1, ensure_ascii=False),
+                            encoding="utf-8", newline="\n")
+    return g
+
+
+def cargar_json(p: Path):
+    try:
+        return json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+
+def grafo_vigente(reconstruir: bool = False) -> dict:
+    if reconstruir:
+        return construir_grafo(True)
+    g = cargar_json(path_grafo())
+    if isinstance(g, dict) and g.get("nodos"):
+        return g
+    return construir_grafo()
+
+
+def adyacentes(g: dict, nid: str) -> list[tuple[str, str, str]]:
+    """(vecino, tipo_de_arista, direccion) para un nodo."""
+    out = []
+    for a in g.get("aristas", []):
+        if a["o"] == nid:
+            out.append((a["d"], a["t"], "->"))
+        elif a["d"] == nid:
+            out.append((a["o"], a["t"], "<-"))
+    vistos, unicos = set(), []
+    for v in out:
+        if v not in vistos:
+            vistos.add(v)
+            unicos.append(v)
+    return unicos
+
+
+def resolver_nodo(g: dict, consulta: str) -> list[str]:
+    q = consulta.lower()
+    exactos = [n for n in g.get("nodos", {})
+               if n.split(":", 1)[-1].lower() == q or n.lower() == q]
+    if exactos:
+        return exactos
+    return [n for n in g.get("nodos", {}) if q in n.lower()]
+
+
+@cli.command("grafo")
+@click.option("--que-toca", "que_toca", help="Tickets y docs que tocaron ese archivo.")
+@click.option("--vecinos", help="Nodos adyacentes a un slug, contrato o archivo.")
+@click.option("--bloqueos", is_flag=True, help="La cadena de dependencias cross-repo.")
+@click.option("--reconstruir", is_flag=True, help="Rehacer el grafo desde cero.")
+def grafo_cmd(que_toca: str | None, vecinos: str | None, bloqueos: bool,
+              reconstruir: bool) -> None:
+    """Consulta el grafo de adyacencia. Reemplaza barrer 125 archivos."""
+    g = grafo_vigente(reconstruir)
+    nodos = g.get("nodos", {})
+    console.print()
+    console.print(f"[dim]grafo: {len(nodos)} nodos, {len(g.get('aristas', []))} aristas, "
+                  f"generado {g.get('generado', '?')}[/]")
+
+    if que_toca:
+        q = que_toca.lower().replace("\\", "/")
+        arch = [n for n, d in nodos.items() if d.get("tipo") == "archivo" and q in n.lower()]
+        if not arch:
+            console.print(f"[yellow]ningun archivo del grafo matchea '{que_toca}'.[/]")
+            console.print("[dim]El grafo solo conoce archivos de ramas sin mergear.[/]")
+            return
+        trabajos: dict[str, set[str]] = {}
+        for a in arch:
+            for v, t, _ in adyacentes(g, a):
+                if v.startswith(("ticket:", "doc:")):
+                    trabajos.setdefault(v, set()).add(a.split("/", 1)[-1])
+        console.print(f"[bold]{len(arch)} archivos, {len(trabajos)} trabajos que los tocaron[/]")
+        for v, fs in sorted(trabajos.items(), key=lambda kv: -len(kv[1])):
+            console.print(f"  {v}  [dim]({len(fs)} archivos)[/]")
+        console.print()
+        return
+
+    if vecinos:
+        cands = resolver_nodo(g, vecinos)
+        if not cands:
+            raise click.ClickException(f"ningun nodo matchea '{vecinos}'.")
+        for nid in cands[:3]:
+            console.print(f"[bold]{nid}[/]  {nodos.get(nid, {})}")
+            porgrupo: dict[str, list[str]] = {}
+            for v, t, dirn in adyacentes(g, nid):
+                porgrupo.setdefault(f"{t} {dirn}", []).append(v)
+            for k, vs in sorted(porgrupo.items()):
+                archivos = [x for x in vs if x.startswith("archivo:")]
+                otros = [x for x in vs if not x.startswith("archivo:")]
+                if otros:
+                    console.print(f"  {k:<14} " + ", ".join(otros[:8])
+                                  + (f" y {len(otros) - 8} mas" if len(otros) > 8 else ""))
+                if archivos:
+                    console.print(f"  {k:<14} [dim]{len(archivos)} archivos[/]")
+        console.print()
+        return
+
+    if bloqueos:
+        bs = [a for a in g.get("aristas", []) if a["t"] == "bloquea"]
+        if not bs:
+            console.print("[dim]ningun bloqueo cross-repo declarado en los contratos.[/]")
+            console.print()
+            return
+        pares: dict[tuple[str, str], int] = {}
+        for a in bs:
+            pares[(a["o"], a["d"])] = pares.get((a["o"], a["d"]), 0) + 1
+        console.print(f"[bold]{len(pares)} dependencias cross-repo[/]")
+        for (o, d), n in sorted(pares.items(), key=lambda kv: -kv[1]):
+            console.print(f"  {o.split(':', 1)[-1]:<34} bloquea a {d.split(':', 1)[-1]}"
+                          f"  [dim]({n} items)[/]")
+        console.print()
+        return
+
+    tipos: dict[str, int] = {}
+    for d in nodos.values():
+        tipos[d.get("tipo", "?")] = tipos.get(d.get("tipo", "?"), 0) + 1
+    console.print("  " + "  ".join(f"{k}={v}" for k, v in sorted(tipos.items())))
+    console.print("[dim]  --que-toca <archivo> | --vecinos <slug> | --bloqueos[/]")
+    console.print()
+
+
+@cli.command("contexto")
+@click.argument("slug")
+@click.option("--vecinos", "max_vecinos", default=4, show_default=True,
+              help="Cuantos vecinos incluir.")
+def contexto_cmd(slug: str, max_vecinos: int) -> None:
+    """El pack minimo para arrancar una sesion: el ticket y el estado de sus vecinos."""
+    g = grafo_vigente()
+    cands = [n for n in resolver_nodo(g, slug) if n.startswith(("ticket:", "doc:"))]
+    if not cands:
+        raise click.ClickException(
+            f"'{slug}' no esta en el grafo. `factoria grafo --reconstruir` si es nuevo."
+        )
+    nid = cands[0]
+    nodos = g["nodos"]
+
+    # Vecindad de segundo grado: los trabajos que comparten archivo o contrato.
+    compartido: dict[str, set[str]] = {}
+    for v, t, _ in adyacentes(g, nid):
+        if not v.startswith(("archivo:", "contrato:")):
+            continue
+        for w, _t2, _d in adyacentes(g, v):
+            if w != nid and w.startswith(("ticket:", "doc:")):
+                compartido.setdefault(w, set()).add(v)
+    orden = sorted(compartido.items(), key=lambda kv: -len(kv[1]))[:max_vecinos]
+
+    partes = [f"# Contexto de {nid}", ""]
+    p = nodos.get(nid, {}).get("path")
+    if p and Path(p).is_file():
+        partes += [Path(p).read_text(encoding="utf-8", errors="replace").strip(), ""]
+    if orden:
+        partes += ["---", "", "## Vecinos (solo su estado actual)", ""]
+        for w, via in orden:
+            wp = nodos.get(w, {}).get("path")
+            est = ""
+            if wp and Path(wp).is_file():
+                est = _seccion(Path(wp).read_text(encoding="utf-8", errors="replace"),
+                               "## Estado actual")
+            razon = ", ".join(sorted(x.split("/", 1)[-1] for x in list(via)[:3]))
+            partes += [f"### {w}", f"_comparte: {razon}_", "",
+                       (est[:1200] or "_(sin seccion 'Estado actual')_"), ""]
+    contratos = [v for v, t, _ in adyacentes(g, nid) if v.startswith("contrato:")]
+    if contratos:
+        partes += ["---", "", "## Contratos que toca", ""]
+        partes += [f"- `.contracts\\{c.split(':', 1)[-1]}.md`" for c in contratos]
+    click.echo("\n".join(partes))
 
 
 @cli.command("perfiles")
