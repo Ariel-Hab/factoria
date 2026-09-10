@@ -2224,8 +2224,15 @@ def adoptar_cmd(slug: str, session_id: str | None, repo: str | None, forzar: boo
 @click.argument("slug")
 @click.argument("nueva")
 @click.option("--repo", help="Cuando el ticket tiene varios repos.")
-def rama_cmd(slug: str, nueva: str, repo: str | None) -> None:
-    """Renombra la rama de un ticket, en git y en el registro."""
+@click.option("--solo-registro", is_flag=True,
+              help="No tocar git: solo cambiar a que rama apunta el ticket.")
+def rama_cmd(slug: str, nueva: str, repo: str | None, solo_registro: bool) -> None:
+    """Renombra la rama de un ticket, en git y en el registro.
+
+    `--solo-registro` para cuando el ticket quedo apuntando a una rama AJENA:
+    ahi renombrar en git le rompe la rama a otro trabajo. Es el caso de los
+    tickets creados antes de que `new` dejara de adoptar la rama actual.
+    """
     t = buscar_ticket(slug)
     e = _entrada_unica(t, repo)
     if e.rama == nueva:
@@ -2235,7 +2242,10 @@ def rama_cmd(slug: str, nueva: str, repo: str | None) -> None:
     if not rp:
         raise click.ClickException(f"no encuentro el repo '{e.repo}' en disco.")
     vieja = e.rama
-    _renombrar_rama(rp, vieja, nueva)
+    if solo_registro:
+        console.print(f"[dim]git no se toca: '{vieja}' sigue como esta en {e.repo}.[/]")
+    else:
+        _renombrar_rama(rp, vieja, nueva)
     e.rama = nueva
     escribir_ticket(t)
     regenerar_indice()
