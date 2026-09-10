@@ -54,6 +54,28 @@ COTA_CONTRATO = 250
 COTA_DOC_TRABAJO = 200
 # Umbral inicial para recomendar cortar sesion. Se calibra midiendo (plan §7.5).
 UMBRAL_SESION_MB = 1.0
+# Calibrado el 2026-09-10 con los 50.401 turnos con `usage` de las 342 sesiones
+# en disco, en tokens equivalentes de input fresco (lectura de cache 0,1x,
+# escritura 1,25x, input 1x):
+#
+#   arrancar de cero (primer turno, mediana de 252)   41.400
+#   continuar, 0 - 0,25 MB                            11.500    0,28x
+#   continuar, 0,5 - 1 MB                             20.300    0,49x
+#   continuar, 1 - 2 MB                               29.500    0,71x
+#   continuar, mas de 8 MB                            29.500    0,71x
+#
+# El costo se SATURA en 1 MB. Arriba de ahi el tamano del .jsonl no predice
+# nada, porque la compactacion vacia el prefijo: en la sesion de este ticket el
+# cache read sube a 450k tokens y se derrumba a 30k, siete veces en 8,9 MB. El
+# .jsonl es el registro acumulado de lo que paso, no lo que hay en contexto.
+#
+# Dos correcciones a la regla original, que suponia costo creciente:
+#   1. continuar un turno NUNCA cuesta mas que reconstruir (peor caso 0,71x),
+#      asi que cortar no ahorra en el turno siguiente;
+#   2. cortar se paga recien despues de ~3 turnos.
+# O sea: cortar si vas a seguir trabajando, no para hacer una pregunta. Y un
+# .jsonl de 8 MB no es mas urgente que uno de 1,5 MB.
+TURNOS_PARA_QUE_CONVENGA = 3
 # Una sesion que no se toca en mas de esto ya no se va a reanudar: no es hallazgo.
 DIAS_SESION_VIVA = 7
 
@@ -650,10 +672,13 @@ def hallazgos(rel: Relevamiento) -> list[str]:
     if caras:
         h.append(
             f"[yellow]sesiones[/] {len(caras)} activas (<={DIAS_SESION_VIVA}d) por encima de "
-            f"{UMBRAL_SESION_MB:.1f} MB, conviene cortarlas: "
+            f"{UMBRAL_SESION_MB:.1f} MB, donde el costo por turno ya toco el techo "
+            "(0,7x de reconstruirlas, medido): "
             + ", ".join(f"{s.rama or s.proyecto} ({s.mb:.1f}MB)" for s in caras[:3])
             + (f" y {len(caras) - 3} mas" if len(caras) > 3 else "")
-            + "  ->  factoria cortar <rama> --fork"
+            + f". El tamano de aca en mas no cambia el costo, asi que no hay una "
+              f"mas urgente que otra: cortar la que vayas a seguir mas de "
+              f"{TURNOS_PARA_QUE_CONVENGA} turnos  ->  factoria cortar <rama> --fork"
         )
 
     # El agujero de trazabilidad: una tarea con N conversaciones y ningun indice.
@@ -728,8 +753,10 @@ def hallazgos(rel: Relevamiento) -> list[str]:
                 + "  ->  factoria grafo --que-toca <archivo>"
             )
 
+    # Solo los abiertos: ver _estado_spec, `close` cambia la huella a proposito.
     derivados = [t for t in rel.tickets
-                 if t.spec_congelado and huella_spec(t) != t.spec_congelado]
+                 if t.abierto and t.spec_congelado
+                 and huella_spec(t) != t.spec_congelado]
     if derivados:
         h.append(
             f"[red]spec-drift[/] {len(derivados)} tickets cambiaron criterios o fuera de "
@@ -1265,11 +1292,14 @@ def resume(consulta: str, repo: str | None, cuenta: str | None, elegir: int | No
         return
     if d.mb >= UMBRAL_SESION_MB:
         console.print(
-            f"[yellow]Ojo:[/] esta sesion pesa {d.mb:.1f} MB (umbral {UMBRAL_SESION_MB}). "
-            "Cada turno paga lectura de cache sobre todo ese prefijo.\n"
-            f"[dim]Alternativas: factoria cortar {consulta} --fork  (ramifica, "
-            f"conserva el contexto)\n             factoria resume {consulta} --nueva  (limpia, con el pack del "
-            f"ticket)[/]\n"
+            f"[yellow]Ojo:[/] esta sesion pesa {d.mb:.1f} MB, sobre el umbral de "
+            f"{UMBRAL_SESION_MB}: su costo por turno ya esta en el techo, 0,7x de "
+            "reconstruirla. Arriba de 1 MB el tamano no cambia nada -- la "
+            "compactacion vacia el prefijo, y el .jsonl solo acumula el registro.\n"
+            f"[dim]Cortar se paga despues de ~{TURNOS_PARA_QUE_CONVENGA} turnos, o sea "
+            "conviene si vas a seguir trabajando y no para una pregunta:\n"
+            f"  factoria cortar {consulta} --fork   (ramifica, conserva el contexto)\n"
+            f"  factoria resume {consulta} --nueva  (limpia, con el pack del ticket)[/]\n"
         )
     _lanzar_en(d.cuenta, d.cwd, ["-r", d.session_id], forzar, imprimir, d.nota)
 
@@ -2106,6 +2136,12 @@ def _estado_spec(t: Ticket) -> str:
     """Que dice el tablero sobre el spec: es el gate que existe de verdad."""
     if not t.spec_congelado:
         return "sin aprobar"
+    # Un ticket cerrado daria deriva SIEMPRE: `close` archiva el cuerpo en
+    # historial/ y deja un puntero, asi que la huella cambia por diseño. La
+    # deriva solo dice algo mientras el trabajo esta en vuelo; despues es ruido
+    # que acusa al propio `close`.
+    if not t.abierto:
+        return "aprobado"
     return "aprobado" if huella_spec(t) == t.spec_congelado else "deriva"
 
 

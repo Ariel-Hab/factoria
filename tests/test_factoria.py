@@ -348,3 +348,22 @@ def test_resume_sin_nueva_apunta_a_nueva_cuando_la_cuenta_no_tiene_sesion():
     fuente = FUENTE.read_text(encoding="utf-8")
     i = fuente.index("no tiene entrada para esos filtros")
     assert "--nueva --cuenta" in fuente[i:i + 700]
+
+
+def test_un_ticket_cerrado_no_reporta_spec_drift():
+    """`close` archiva el cuerpo y deja un puntero, asi que la huella cambia por
+    diseño. Reportar deriva ahi es acusar al propio `close`."""
+    t = fx.Ticket(slug="x", abierto=False, spec_congelado="deadbeef",
+                  cuerpo="## Estado actual\nCerrado, el cuerpo esta en historial/.\n")
+    assert fx._estado_spec(t) == "aprobado"
+    t.abierto = True
+    assert fx._estado_spec(t) == "deriva"
+    # y el hallazgo de board tiene que filtrar igual
+    assert "if t.abierto and t.spec_congelado" in FUENTE.read_text(encoding="utf-8")
+
+
+def test_el_umbral_esta_calibrado_y_no_estimado():
+    """El numero puede cambiar; lo que no puede es volver a ser una estimacion
+    sin la regla de payback que salio de la medicion."""
+    assert fx.UMBRAL_SESION_MB == 1.0
+    assert fx.TURNOS_PARA_QUE_CONVENGA == 3
