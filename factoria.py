@@ -90,6 +90,12 @@ def descubrir_repos() -> list[Path]:
         for d in sorted(raiz.iterdir()):
             if d.is_dir() and (d / ".git").exists() and d.name not in IGNORAR_REPOS:
                 repos.append(d)
+    # El repo de datos va explicito: no esta bajo ninguna raiz, pero es un repo
+    # con remoto y trabajo real -- los 13 contratos y los tickets viven ahi. Sin
+    # esto, podar un contrato no puede ser un ticket, porque `commit` y `check`
+    # no tienen donde correr.
+    if (DATOS / ".git").exists():
+        repos.append(DATOS)
     return repos
 
 
@@ -2058,8 +2064,19 @@ def abrir_cmd(slug: str) -> None:
         console.print(f"[dim]no pude abrir el navegador ({exc}); la URL esta arriba.[/]")
 
 
-def _entrada_unica(t: Ticket, repo: str | None) -> RepoTicket:
-    entradas = [e for e in t.repos if not repo or repo.lower() in e.repo.lower()]
+def _entrada_unica(t: Ticket, repo: str | None, exacto: bool = False) -> RepoTicket:
+    """La entrada del ticket para un repo.
+
+    `exacto` cuando el nombre no lo tipeo una persona: por substring, el repo
+    `factoria` matchea la entrada `.factoria` y `check` termina escribiendo la
+    evidencia de un repo en el doc del otro. Para `--repo` el substring es
+    comodidad; para un `rp.name` es un error silencioso.
+    """
+    def coincide(e: RepoTicket) -> bool:
+        if not repo:
+            return True
+        return e.repo.lower() == repo.lower() if exacto else repo.lower() in e.repo.lower()
+    entradas = [e for e in t.repos if coincide(e)]
     if not entradas:
         raise click.ClickException(
             f"'{t.slug}' no tiene entrada para --repo {repo}. Repos: "
@@ -2091,6 +2108,48 @@ def _renombrar_rama(rp: Path, vieja: str, nueva: str) -> None:
     else:
         console.print(f"[dim]{rp.name} no tiene la rama '{vieja}'; solo se "
                       "actualiza el registro del ticket.[/]")
+
+
+@cli.command("cotas")
+@click.option("--contratos/--no-contratos", default=True)
+@click.option("--tickets/--no-tickets", default=True)
+@click.option("--docs/--no-docs", default=True)
+def cotas_cmd(contratos: bool, tickets: bool, docs: bool) -> None:
+    """Mide las cotas del estandar y sale con 1 si alguna se paso.
+
+    La regla 2 del estandar pide guardian EXTERNO, y hasta ahora el unico era
+    `board`, que informa y sale con 0. Sin codigo de salida no se puede colgar
+    de un `verify:` ni de un pre-push, y toda cota que se auto-vigilaba en un
+    .md decayo: el §7 de Cotizaciones tiene su cota escrita adentro y ocupa
+    1395 lineas. Esto es rapido a proposito -- solo cuenta lineas, no toca git.
+    """
+    grupos: list[tuple[str, int, list[tuple[str, int]]]] = []
+    if contratos:
+        grupos.append(("contratos", COTA_CONTRATO, cotas_contratos()))
+    if tickets:
+        grupos.append(("tickets", COTA_TICKET,
+                       sorted(((t.slug, t.lineas) for t in tickets_todos()),
+                              key=lambda x: -x[1])))
+    if docs:
+        raiz = DATOS / "docs"
+        medidos = [
+            (str(p.relative_to(raiz)),
+             len(p.read_text(encoding="utf-8", errors="replace").splitlines()))
+            for p in sorted(raiz.rglob("*.md"))
+        ] if raiz.is_dir() else []
+        grupos.append(("docs de trabajo", COTA_DOC_TRABAJO,
+                       sorted(medidos, key=lambda x: -x[1])))
+
+    excedidos = 0
+    for nombre, cota, medidos in grupos:
+        malos = [(n, l) for n, l in medidos if l > cota]
+        excedidos += len(malos)
+        estado = f"[red]{len(malos)} pasan[/]" if malos else "[green]ok[/]"
+        console.print(f"[bold]{nombre}[/] cota {cota}: {len(medidos)} medidos, {estado}")
+        for n, l in malos:
+            console.print(f"  [red]{l:>5}[/]  {n}  [dim]({l / cota:.1f}x)[/]")
+    if excedidos:
+        raise SystemExit(1)
 
 
 @cli.command("adoptar")
@@ -2143,6 +2202,14 @@ def adoptar_cmd(slug: str, session_id: str | None, repo: str | None, forzar: boo
         mb = tam / 1_048_576
         console.print(f"  [dim]{mb:.1f} MB · rama '{m['rama'] or '?'}' · "
                       f"{m['titulo'] or 'sin titulo'}[/]")
+        if m["cwd"] and e.cwd and str(Path(m["cwd"])).lower() != str(Path(e.cwd)).lower():
+            # `resume` hace `cd <cwd>` antes de `-r`: apuntar a un directorio
+            # donde la sesion nunca corrio la deja sin sus archivos abiertos.
+            # Que el cwd no sea el del repo del ticket es legitimo -- una sesion
+            # puede editar otro repo -- pero tiene que quedar registrado.
+            console.print(f"  [dim]cwd {e.cwd} -> {m['cwd']} (donde corre la sesion)[/]")
+            e.cwd = m["cwd"]
+            escribir_ticket(t)
         if m["rama"] and e.rama and m["rama"] != e.rama:
             # No se corrige en silencio: cual de las dos es la buena es una
             # decision, y `rama` es el comando que la aplica en git tambien.
@@ -2725,10 +2792,16 @@ o lo deja en el archivo que `factoria commit --seco` te muestra.
         return
     rama = git(rp, "rev-parse", "--abbrev-ref", "HEAD")
     pf = perfil(rp.name)
-    prohibidas = tuple(pf.get("ramas_prohibidas") or RAMAS_PROHIBIDAS)
+    # `or` no sirve aca: una lista vacia explicita es una decision, no un campo
+    # sin llenar. El repo de datos declara `ramas_prohibidas: []` porque `main`
+    # es el unico lugar donde su verdad puede estar, y con `or` volvia el
+    # default y el commit se negaba siempre, en silencio.
+    prohibidas = tuple(pf["ramas_prohibidas"] if "ramas_prohibidas" in pf
+                       else RAMAS_PROHIBIDAS)
     if rama in prohibidas:
-        if seco:
-            console.print(f"[dim]{rp.name}: rama '{rama}' protegida, no se commitea.[/]")
+        # Se avisa siempre, no solo en --seco: quedarse callado con cambios sin
+        # commitear en una rama protegida es como se pierde trabajo.
+        console.print(f"[dim]{rp.name}: rama '{rama}' protegida, no se commitea.[/]")
         return
 
     archivo = path_msg(rp.name, rama)
@@ -3104,7 +3177,7 @@ def check_cmd(slug: str | None, instalar_pre_push: bool) -> None:
 
     if slug:
         t = buscar_ticket(slug)
-        e = _entrada_unica(t, rp.name)
+        e = _entrada_unica(t, rp.name, exacto=True)
         if e.doc and Path(e.doc).is_file():
             bloque = (f"\n## Evidencia ({time.strftime('%Y-%m-%d %H:%M')})\n\n"
                       + "\n".join(lineas_ev) + "\n")

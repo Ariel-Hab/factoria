@@ -103,3 +103,29 @@ def test_toda_fase_tiene_skills_sin_tracker():
     adoptadas |= {n for n, _ in fx.SKILLS_TRANSVERSALES}
     assert not (adoptadas & descartadas)
     assert set(fx.SKILLS_POR_FASE) <= set(fx.FASES)
+
+
+def test_lista_vacia_explicita_no_vuelve_al_default():
+    """`ramas_prohibidas: []` es una decision del repo de datos, no un hueco.
+
+    Con `or` volvia la tupla por defecto y `commit` se negaba en `main` siempre
+    y sin decir nada, o sea el hook Stop no commiteaba nunca.
+    """
+    pf = fx.perfil(".factoria")
+    assert "ramas_prohibidas" in pf
+    assert pf["ramas_prohibidas"] == []
+    fuente = FUENTE.read_text(encoding="utf-8")
+    assert "or RAMAS_PROHIBIDAS" not in fuente
+
+
+def test_entrada_por_nombre_de_repo_es_exacta():
+    """`factoria` no puede matchear la entrada `.factoria`.
+
+    Por substring, `check` corrido en el repo de codigo escribia su evidencia
+    en el doc del ticket del repo de datos.
+    """
+    t = fx.Ticket(slug="x", repos=[fx.RepoTicket(repo=".factoria", cuenta="dfv")])
+    assert fx._entrada_unica(t, "factoria").repo == ".factoria"   # comodidad de --repo
+    import pytest as _p
+    with _p.raises(Exception):
+        fx._entrada_unica(t, "factoria", exacto=True)
