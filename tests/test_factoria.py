@@ -144,3 +144,44 @@ def test_adoptar_no_huerfana_al_cambiar_de_cuenta():
     cuerpo = fuente[i:j]
     assert "jsonl_de(previa, cuenta_previa)" in cuerpo
     assert "jsonl_de(previa, cta)" not in cuerpo
+
+
+def _pasos(rama, base, trabajo_es_worktree=False, pusheada=False, repo="defeve"):
+    from pathlib import Path as _P
+    rp = _P(r"C:\ariel\dfv") / repo
+    trabajo = _P(r"C:\ariel\dfv\wt\x") if trabajo_es_worktree else rp
+    e = fx.RepoTicket(repo=repo, cuenta="dfv", rama=rama, cwd=str(trabajo))
+    return "\n".join(fx._pasos_manuales("slug", rp, trabajo, e, base, pusheada))
+
+
+def test_close_no_propone_borrar_la_base():
+    """`new --aqui` registra la rama actual, que puede ser la base."""
+    txt = _pasos("main", "main", pusheada=True)
+    assert "branch -d" not in txt
+    assert "--delete" not in txt
+    assert "http" not in txt     # ni URL de compare: no hay nada que comparar
+
+
+def test_close_no_propone_borrar_una_rama_protegida():
+    txt = _pasos("desarrollo-ari", "master", pusheada=True)
+    assert "branch -d" not in txt and "--delete" not in txt
+    assert "protegida" in txt
+
+
+def test_close_ordena_push_pr_y_recien_despues_el_borrado():
+    txt = _pasos("feature/x", "master", trabajo_es_worktree=True)
+    i_push = txt.index("push -u origin feature/x")
+    i_pr = txt.index("PR")
+    i_wt = txt.index("--limpiar-worktree")
+    i_del = txt.index("branch -d feature/x")
+    assert i_push < i_pr < i_wt < i_del, txt
+    # El worktree ANTES del borrado local: con la rama checkouteada ahi,
+    # `branch -d` no puede sacarla.
+    assert "mergeado" in txt
+    assert "-D" not in txt      # nunca forzar
+
+
+def test_close_sin_worktree_no_menciona_worktree():
+    txt = _pasos("fix/y", "master", pusheada=True)
+    assert "worktree" not in txt
+    assert "branch -d fix/y" in txt

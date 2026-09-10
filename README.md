@@ -62,10 +62,36 @@ Los comandos, en el orden en que se usan:
 | 5 | `commit --mensaje "…"` | valida `<tipo>: <imperativo>` ≤60 chars, protege ramas y archivos |
 | 6 | `check --slug <slug>` | corre los `verify:` del perfil + las cotas, y escribe la evidencia |
 | 7 | `fase <slug> dev\|test` | metadata. **No corta la sesión** |
-| 8 | `close <slug>` | pushea, archiva el cuerpo, imprime el compare. **No crea el PR** |
+| 8 | `close <slug>` | archiva el cuerpo e imprime **los pasos que faltan a mano**, en orden. `--sin-pushear` para cerrar sin tocar el remoto |
 
 Flags de `new` que importan: `--aqui` (no crear rama, usar la actual),
 `--pedido "…"` (en vez de abrir el editor), `--no-lanzar`, `--tipo fix|chore`.
+
+### Cerrar sin pushear
+
+`close` pushea por defecto. Con `--sin-pushear` no toca el remoto y el push pasa
+a ser el primer paso de la lista que imprime:
+
+```
+Falta a mano, en este orden:
+
+  defeve
+    1. git -C C:\ariel\dfv\wt\rediseno-home push -u origin feature/rediseno-home
+    2. abrir el PR a mano en Bitbucket:  https://bitbucket.org/dfvsrl/defeve/branch/...
+    3. cuando el PR este mergeado, y no antes:
+         factoria close mi-slug --repo defeve --limpiar-worktree
+         git -C C:\ariel\dfv\defeve branch -d feature/rediseno-home
+         git -C C:\ariel\dfv\defeve push origin --delete feature/rediseno-home
+```
+
+El orden no es decorativo: el worktree va **antes** del borrado local, porque
+mientras la rama esté checkouteada ahí `branch -d` no puede sacarla. Y es `-d`
+minúscula a propósito — si falla, algo no se mergeó: hay que mirar, no forzar
+con `-D`.
+
+Si la rama registrada es la base (pasa con `new --aqui`) o está en
+`ramas_prohibidas`, **no propone borrarla**. Y cerrar dos veces no re-archiva:
+el historial no se pisa.
 
 ## Volver a una tarea
 
@@ -206,8 +232,8 @@ porque nombran repos y rutas internas.
 3. **Lo determinista y con estado va en código; el juicio sobre contenido, en una
    skill.** Las cotas escritas en un `.md` decayeron todas — por eso `cotas` sale
    con código de error y se cuelga de un `verify:`.
-4. **No hay PR automático ni merge.** `close` pushea e imprime el compare. En
-   `defeve` el merge a `master` es siempre por PR en Bitbucket.
+4. **No hay PR automático ni merge.** `close` te deja los comandos y ahí para.
+   En `defeve` el merge a `master` es siempre por PR en Bitbucket.
 
 ## Cuando algo no anda
 
