@@ -1689,6 +1689,25 @@ def fase_cmd(slug: str, nueva: str) -> None:
         f"Cortá cuando pese, no cuando cambie la fase: factoria sesiones --repo "
         f"{t.repos[0].repo if t.repos else ''}[/]"
     )
+    # El handoff de fase y el trabajo de cada fase los hace una skill: es juicio
+    # sobre contenido, no algo determinista. factoria solo dice cual y donde.
+    destino = DATOS / "handoffs" / f"{t.slug}-{previa}.md"
+    if not destino.is_file():
+        console.print(
+            f"\n[bold]Handoff de {previa}:[/] corré [bold]/mattpocock-skills:handoff[/] "
+            f"y guardá la salida en\n  {destino}\n"
+            "[dim]Va afuera del ticket para no romperle la cota de 120 lineas.[/]"
+        )
+    sugerencias = {
+        "plan": "[bold]/mattpocock-skills:grilling[/] para llenar 'Supuestos abiertos', "
+                "y [bold]/mattpocock-skills:to-spec[/] para los criterios de aceptacion",
+        "dev": "[bold]/mattpocock-skills:tdd[/] -- los tests que deja son los `verify:` "
+               "que le faltan al perfil para que `check` sirva de DoD",
+        "test": "[bold]/mattpocock-skills:code-review[/] -- su eje Spec lee el issue de "
+                f"origen, que aca es {t.issue_url or 'el que cree `factoria espejo`'}",
+    }
+    if (sug := sugerencias.get(nueva)):
+        console.print(f"\n[bold]Para la fase {nueva}:[/] {sug}")
 
 
 @cli.command()
