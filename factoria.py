@@ -3115,6 +3115,60 @@ def _ritual_worktree(rp: Path, pf: dict, rama: str, base: str) -> str:
     return str(destino)
 
 
+def _archivar(t: Ticket, hist: Path) -> str:
+    """Mueve el cuerpo al historial y deja el ticket en una linea.
+
+    Devuelve la seccion `## Decisiones`, que es lo unico que sobrevive al
+    resumen porque `close` la imprime para pasarla a un ADR.
+    """
+    hist.parent.mkdir(parents=True, exist_ok=True)
+    hist.write_text(
+        f"# {t.slug}\n\nCerrado {time.strftime('%Y-%m-%d')}. "
+        f"Fase final: {t.fase}. Issue: {t.issue_url or '-'}\n\n" + t.cuerpo.strip() + "\n",
+        encoding="utf-8", newline="\n")
+    decisiones = _seccion(t.cuerpo, "## Decisiones")
+    t.cuerpo = (f"# {t.slug}\n\n## Estado actual\n\nCerrado. El cuerpo completo esta en "
+                f"`historial/{t.slug}.md`.\n")
+    return decisiones
+
+
+def _pasos_manuales(slug: str, rp: Path, trabajo: Path, e: RepoTicket, base: str,
+                    pusheada: bool) -> list[str]:
+    """Los pasos que factoria NO hace, en el orden en que hay que hacerlos.
+
+    El borrado de rama va condicionado al merge y con `-d` minuscula a
+    proposito: si falla es que algo no se mergeo, y ahi hay que investigar, no
+    forzar con `-D`. Y el worktree va ANTES del borrado local: mientras la rama
+    este checkouteada en un worktree, `branch -d` no puede sacarla.
+    """
+    rama = e.rama
+    if not rama:
+        return []
+    # Nunca proponer borrar la base ni una rama protegida: seria el peor consejo
+    # posible, y pasa de verdad porque `new --aqui` registra la rama actual.
+    prohibidas = set(perfil(e.repo).get("ramas_prohibidas") or ()) | {base}
+    borrable = rama not in prohibidas
+    pasos = []
+    if not pusheada:
+        pasos.append(f"git -C {trabajo} push -u origin {rama}")
+    if (u := url_compare(rp, base, rama)):
+        bitbucket = "bitbucket.org" in u
+        pasos.append(("abrir el PR a mano en Bitbucket" if bitbucket
+                      else f"abrir el PR de {rama} a {base}") + f":  {u}")
+    if not borrable:
+        pasos.append(f"[dim]'{rama}' es la base o una rama protegida: no se borra.[/]")
+        return pasos
+    hay_wt = trabajo != rp
+    pasos.append("[bold]cuando el PR este mergeado[/], y no antes:")
+    if hay_wt:
+        pasos.append(f"  factoria close {slug} --repo {e.repo} --limpiar-worktree"
+                     "   [dim](junctions con rmdir y despues worktree remove)[/]")
+    pasos.append(f"  git -C {rp} branch -d {rama}   "
+                 "[dim](-d minuscula: si falla, no se mergeo)[/]")
+    pasos.append(f"  git -C {rp} push origin --delete {rama}")
+    return pasos
+
+
 @cli.command("close")
 @click.argument("slug")
 @click.option("--repo", help="Cerrar solo la entrada de un repo.")
@@ -3141,28 +3195,35 @@ def close_cmd(slug: str, repo: str | None, pushear: bool, limpiar_worktree: bool
                 "Cerrá con el arbol limpio: si no, lo que quede afuera no se pushea."
             )
         base = perfil(e.repo).get("base") or base_de(rp) or ""
+        pusheada = False
         if pushear and e.rama:
             r = subprocess.run(["git", "-C", str(trabajo), "push", "-u", "origin", e.rama],
                                capture_output=True, text=True, encoding="utf-8",
                                errors="replace")
-            console.print(f"[dim]{e.repo}: push {'ok' if r.returncode == 0 else 'FALLO'}[/]")
-            if r.returncode != 0:
+            pusheada = r.returncode == 0
+            console.print(f"[dim]{e.repo}: push {'ok' if pusheada else 'FALLO'}[/]")
+            if not pusheada:
                 console.print(f"  [yellow]{(r.stderr or '').strip()[:200]}[/]")
-        if (u := url_compare(rp, base, e.rama)):
-            urls.append((e.repo, u))
+        elif e.rama:
+            # Sin push no hay nada que comparar todavia: la rama no esta en el
+            # remoto. `pusheada` queda en False y el primer paso manual es el push.
+            pusheada = bool(git(rp, "rev-parse", "--verify", "--quiet",
+                                f"refs/remotes/origin/{e.rama}"))
         if limpiar_worktree and e.cwd and Path(e.cwd) != rp and Path(e.cwd).exists():
             _quitar_worktree(rp, Path(e.cwd))
+            trabajo = rp
+        if (pasos := _pasos_manuales(t.slug, rp, trabajo, e, base, pusheada)):
+            urls.append((e.repo, pasos))
 
-    # Archivar: el cuerpo va al historial y el ticket queda en una linea.
+    # Archivar UNA vez. Al segundo `close` el cuerpo ya es el puntero al
+    # historial, asi que re-archivar sobrescribe el historial con "el cuerpo
+    # completo esta en historial/" -- se pierde lo archivado la primera vez.
     hist = DATOS / "historial" / f"{t.slug}.md"
-    hist.parent.mkdir(parents=True, exist_ok=True)
-    hist.write_text(
-        f"# {t.slug}\n\nCerrado {time.strftime('%Y-%m-%d')}. "
-        f"Fase final: {t.fase}. Issue: {t.issue_url or '-'}\n\n" + t.cuerpo.strip() + "\n",
-        encoding="utf-8", newline="\n")
-    decisiones = _seccion(t.cuerpo, "## Decisiones")
-    t.cuerpo = (f"# {t.slug}\n\n## Estado actual\n\nCerrado. El cuerpo completo esta en "
-                f"`historial/{t.slug}.md`.\n")
+    if not t.abierto and hist.is_file():
+        console.print(f"[dim]{t.slug} ya estaba cerrado: no se re-archiva.[/]")
+        decisiones = ""
+    else:
+        decisiones = _archivar(t, hist)
     t.fase, t.abierto = "cerrado", False
     escribir_ticket(t)
     espejar_si_se_puede(t)
@@ -3176,9 +3237,13 @@ def close_cmd(slug: str, repo: str | None, pushear: bool, limpiar_worktree: bool
             if l.strip():
                 console.print(f"  {l.strip()}")
     if urls:
-        console.print("\n[bold]Para armar el PR a mano:[/]")
-        for r, u in urls:
-            console.print(f"  {r:<18} {u}")
+        console.print("\n[bold]Falta a mano, en este orden:[/]")
+        for nombre, pasos in urls:
+            console.print(f"\n  [bold]{nombre}[/]")
+            for n, paso in enumerate(pasos, 1):
+                # Los sub-pasos del borrado ya vienen indentados: no se numeran.
+                pref = f"  {n}. " if not paso.startswith("  ") else "     "
+                console.print(f"  {pref}{paso}")
     console.print("\n[dim]factoria no crea el PR ni mergea: eso es tuyo y de los "
                   "revisores.[/]")
     console.print()
