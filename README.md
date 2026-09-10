@@ -116,16 +116,38 @@ factoria cortar <slug> --fork   # corta cuando pesa, preservando la anterior
 factoria contexto <slug>        # el pack mínimo para arrancar fresco: ticket + vecinos
 ```
 
+### Cambiar de cuenta
+
 **Las cuentas `dfv` y `personal` son transcripts disjuntos** (dos directorios
 distintos, 0 uuid en común sobre 337): una sesión **no se puede reanudar desde
-la otra cuenta**. Lo que se cambia es a qué cuenta apunta el ticket.
+la otra cuenta**. Lo que se muda no es la conversación — es a qué sesión y a
+qué cuenta apunta el ticket. El trabajo entra en la sesión nueva por `contexto`.
+
+```mermaid
+flowchart LR
+    T["ticket<br/><i>cuenta: personal</i>"] -.->|"la charla NO se muda"| X(("✗"))
+    T --> A["abrís una sesión<br/>en la otra cuenta"]
+    A --> B["<b>adoptar slug --aqui</b><br/><i>el ticket pasa a ser de ésta</i>"]
+    B --> C["<b>contexto slug</b><br/><i>el trabajo entra acá</i>"]
+    style B fill:#238636,color:#fff
+    style C fill:#1f6feb,color:#fff
+    style X fill:#6e7681,color:#fff
+```
 
 | Quiero… | Comando |
 |---|---|
-| la sesión que ya existe en la otra cuenta | `resume <slug> --repo R` |
-| arreglar "la abrí en la cuenta equivocada" | `adoptar <slug> --cuenta personal` |
+| la sesión que ya existe, en su cuenta | `resume <slug> --repo R` |
+| **seguir el ticket acá, en esta sesión** | `adoptar <slug> --aqui` y después `contexto <slug>` |
+| arreglar "el ticket apunta a un uuid fantasma" | `adoptar <slug>` |
 | una entrada nueva, con su propia sesión | `open <slug> --repo R --cuenta personal` |
 | el trabajo, no la conversación | `contexto <slug>` y sesión fresca donde sea |
+
+`adoptar` **sin uuid busca por evidencia**: la sesión cuyo transcript nombra el
+slug, en las dos cuentas, y le repunta también la cuenta. Si ninguna lo nombra
+se niega y lista las candidatas, en vez de tomar "la más reciente con el mismo
+`cwd`" — ese `cwd` lo comparten 6 sesiones de temas distintos, así que esa
+heurística elige conversaciones ajenas. `--aqui` es el caso sin adivinanza: la
+sesión desde la que se corre el comando, que Claude Code expone en el entorno.
 
 ## El tablero de GitHub
 
@@ -242,6 +264,7 @@ porque nombran repos y rutas internas.
 | `commit` no commitea y no dice nada | la rama está en `ramas_prohibidas` del perfil | ahora avisa; si el repo trabaja en `main` legítimamente, poner `ramas_prohibidas: []` |
 | `check` no verifica casi nada | ese perfil no declara `verify:` | agregarlo, o es un linter de cotas y no un DoD |
 | `resume` abre una sesión vacía | el ticket apunta a un uuid reservado que nunca se abrió | `factoria adoptar <slug>` |
+| `adoptar` registró una sesión que no tiene nada que ver | elegía la más reciente del mismo `cwd`, y ese `cwd` lo comparten 6 | ya elige por evidencia; `--aqui` para la sesión actual |
 | el ticket no aparece en el tablero | el espejo quedó pendiente (sin red, sin `gh`) | `factoria espejo --todos` |
 | un `cd C:\ruta` en bash no llega | bash se come los `\` | `git -C C:/ruta`, o barras normales |
 

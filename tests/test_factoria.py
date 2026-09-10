@@ -185,3 +185,100 @@ def test_close_sin_worktree_no_menciona_worktree():
     txt = _pasos("fix/y", "master", pusheada=True)
     assert "worktree" not in txt
     assert "branch -d fix/y" in txt
+
+
+# --------------------------------------------------------------------------
+# adoptar: elegir la sesion por evidencia, no por mtime
+# --------------------------------------------------------------------------
+
+# Con barras normales a proposito: Path lo normaliza a backslash en los dos
+# lados de la comparacion, y asi el literal no depende del escapeo del shell.
+CWD = "C:/ariel/dfv/defeve"
+
+
+def _ses(sid, cuenta, mtime, cwd=CWD, titulo="x"):
+    return fx.Sesion(cuenta=cuenta, proyecto="p", session_id=sid, mb=1.0,
+                     dias=0, cwd=cwd, mtime=mtime, titulo=titulo)
+
+
+def _elegir(monkeypatch, sesiones, nombran, yo="", cuenta_ticket="dfv",
+            restringida=False):
+    monkeypatch.setattr(fx, "inventario_sesiones", lambda: sesiones)
+    monkeypatch.setattr(fx, "sesiones_que_nombran", lambda _a: set(nombran))
+    monkeypatch.setattr(fx, "sesion_actual", lambda: (yo, "dfv") if yo else None)
+    t = fx.Ticket(slug="mi-slug")
+    e = fx.RepoTicket(repo="defeve", cuenta=cuenta_ticket, cwd=CWD)
+    return fx._elegir_sesion(t, e, cuenta_ticket, restringida=restringida)
+
+
+def test_adoptar_elige_por_evidencia_y_no_por_mtime(monkeypatch):
+    """El bug real: adoptaba la mas reciente del mismo cwd, que era una
+    conversacion ajena que solo habia pasado por ese repo."""
+    ss = [_ses("la-del-ticket", "dfv", 100), _ses("ajena-reciente", "dfv", 999)]
+    sid, cta, motivo = _elegir(monkeypatch, ss, {"la-del-ticket"})
+    assert (sid, cta) == ("la-del-ticket", "dfv")
+    assert "transcript" in motivo
+
+
+def test_adoptar_repunta_la_cuenta_a_la_que_tiene_la_sesion(monkeypatch):
+    """Buscar en las dos cuentas y dejar escrita la vieja deja el ticket
+    apuntando a un uuid que `resume` no encuentra: el bug que arregla."""
+    ss = [_ses("alla", "personal", 100), _ses("aca-ajena", "dfv", 999)]
+    sid, cta, _ = _elegir(monkeypatch, ss, {"alla"}, cuenta_ticket="dfv")
+    assert (sid, cta) == ("alla", "personal")
+
+
+def test_adoptar_se_niega_si_ninguna_sesion_nombra_el_slug(monkeypatch):
+    """Sin evidencia no adivina: lista y pide el uuid o --aqui."""
+    ss = [_ses("ajena", "dfv", 999, titulo="otra cosa")]
+    with pytest.raises(fx.click.ClickException) as exc:
+        _elegir(monkeypatch, ss, set())
+    assert "--aqui" in exc.value.message
+    assert "ajena" in exc.value.message      # la lista, para poder elegir
+
+
+def test_adoptar_no_se_adopta_a_si_misma(monkeypatch):
+    """Correr `adoptar <slug>` deja el slug en el transcript de la sesion que lo
+    corre, asi que seria evidencia de si misma. Para esa esta --aqui."""
+    ss = [_ses("yo", "dfv", 999)]
+    with pytest.raises(fx.click.ClickException):
+        _elegir(monkeypatch, ss, {"yo"}, yo="yo")
+
+
+def test_adoptar_con_cuenta_explicita_no_mira_la_otra(monkeypatch):
+    ss = [_ses("alla", "personal", 999)]
+    with pytest.raises(fx.click.ClickException):
+        _elegir(monkeypatch, ss, {"alla"}, cuenta_ticket="dfv", restringida=True)
+
+
+def test_sesion_actual_sale_del_entorno(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abc")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fx.CUENTAS["personal"]))
+    assert fx.sesion_actual() == ("abc", "personal")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    assert fx.sesion_actual() is None
+
+
+def test_sesiones_que_nombran_encuentra_el_slug_partido_por_el_corte(
+        monkeypatch, tmp_path):
+    """La aguja puede caer a caballo de dos lecturas de 1 MB."""
+    proj = tmp_path / "projects" / "p"
+    proj.mkdir(parents=True)
+    aguja = "mi-slug-largo"
+    relleno = b"x" * ((1 << 20) - 5)          # deja 5 bytes de aguja en el 1er trozo
+    (proj / "s1.jsonl").write_bytes(relleno + aguja.encode())
+    (proj / "s2.jsonl").write_bytes(relleno + b"otra cosa")
+    monkeypatch.setattr(fx, "CUENTAS", {"dfv": tmp_path})
+    assert fx.sesiones_que_nombran(aguja) == {"s1"}
+
+
+def test_adoptar_avisa_pero_no_falla_si_la_sesion_es_de_otro_ticket():
+    """Aviso y no error: --forzar tambien apaga el guard de huerfanas, asi que
+    obligar a --forzar de rutina bypassearia el que importa mas."""
+    fuente = FUENTE.read_text(encoding="utf-8")
+    i = fuente.index("def adoptar_cmd")
+    cuerpo = fuente[i:fuente.index("@cli.command", i)]
+    j = cuerpo.index("ajenos = ")
+    assert "raise" not in cuerpo[j:cuerpo.index("previa, cuenta_previa", j)]
+    # y el no-op tiene que resolverse ANTES del aviso
+    assert cuerpo.index("ya apunta a") < j

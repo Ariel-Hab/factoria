@@ -1071,6 +1071,57 @@ def jsonl_de(session_id: str, cuenta: str) -> Path | None:
     return next(base.rglob(f"{session_id}.jsonl"), None)
 
 
+def sesion_actual() -> tuple[str, str] | None:
+    """El uuid y la cuenta de la sesion de Claude Code desde la que se corre.
+
+    Claude Code exporta las dos cosas al shell de sus herramientas
+    (`CLAUDE_CODE_SESSION_ID`, `CLAUDE_CONFIG_DIR`), asi que "la sesion soy yo"
+    es el unico candidato a adoptar que no hay que adivinar. Devuelve None
+    cuando el comando se corre desde una terminal comun.
+    """
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if not sid:
+        return None
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    cta = next((c for c, raiz in CUENTAS.items()
+                if cfg and Path(cfg).name.lower() == raiz.name.lower()), None)
+    # Sin CLAUDE_CONFIG_DIR queda buscar el .jsonl: el uuid es unico entre las
+    # dos cuentas (0 en comun sobre 337), asi que encontrarlo la identifica.
+    cta = cta or next((c for c in CUENTAS if jsonl_de(sid, c)), None)
+    return (sid, cta) if cta else None
+
+
+def sesiones_que_nombran(aguja: str) -> set[str]:
+    """Ids de las sesiones cuyo transcript contiene `aguja`.
+
+    Es la evidencia que convierte a `adoptar` en deteccion en vez de adivinanza:
+    si el slug esta en el .jsonl, en esa sesion se corrio un comando de factoria
+    con el slug o se abrio el ticket. Barrer los 337 archivos enteros son 359 MB
+    y 0.7 s, mas barato que adoptar la sesion equivocada.
+    """
+    if not aguja:
+        return set()
+    blob = aguja.encode("utf-8")
+    out: set[str] = set()
+    for raiz in CUENTAS.values():
+        base = raiz / "projects"
+        if not base.is_dir():
+            continue
+        for jsonl in base.rglob("*.jsonl"):
+            try:
+                with jsonl.open("rb") as fh:
+                    previo = b""
+                    while trozo := fh.read(1 << 20):
+                        if blob in previo + trozo:
+                            out.add(jsonl.stem)
+                            break
+                        # El solape evita perder un match partido por el corte.
+                        previo = trozo[-len(blob):]
+            except OSError:
+                continue
+    return out
+
+
 def resolver_destino(consulta: str, repo: str | None, cuenta: str | None,
                      elegir: int | None, dias: int, accion: str) -> Destino:
     """El ticket manda: es la clave primaria de una tarea. Solo si el slug no
@@ -2224,58 +2275,131 @@ def cotas_cmd(contratos: bool, tickets: bool, docs: bool) -> None:
         raise SystemExit(1)
 
 
+def _elegir_sesion(t: Ticket, e: RepoTicket, cta: str,
+                   restringida: bool) -> tuple[str, str, str]:
+    """Que sesion adoptar sin uuid. Devuelve (uuid, cuenta, motivo).
+
+    La cuenta sale de DONDE ESTA la sesion elegida, no del ticket: buscar en
+    las dos y despues dejar la cuenta vieja escrita deja el ticket apuntando
+    a un uuid que `resume` no encuentra, que es el bug que este comando
+    arregla.
+
+    El orden de la evidencia es la leccion de haber adoptado la sesion
+    equivocada: el mtime no es evidencia de nada. Que el slug aparezca en el
+    transcript si lo es, y es el unico criterio que decide solo. Sin esa
+    evidencia el comando se niega y lista, porque la mas reciente del mismo cwd
+    puede ser cualquier conversacion que haya pasado por ese repo.
+
+    Sin `--cuenta` mira las dos: cuando `new` reserva el uuid con la cuenta del
+    perfil y el trabajo pasa por la otra, la cuenta del ticket apunta al lado
+    equivocado, y buscar solo ahi garantiza elegir mal.
+    """
+    cuentas = (cta,) if restringida else tuple(CUENTAS)
+    objetivo = str(Path(e.cwd)).lower() if e.cwd else ""
+
+    def mismo_cwd(s: Sesion) -> bool:
+        return bool(objetivo and s.cwd) and str(Path(s.cwd)).lower() == objetivo
+
+    universo = [s for s in inventario_sesiones() if s.cuenta in cuentas]
+    # La sesion que corre el comando nombra el slug porque se acaba de tipear
+    # el comando: no puede ser evidencia de si misma. Para esa esta `--aqui`.
+    yo = (sesion_actual() or ("", ""))[0]
+    nombran = sesiones_que_nombran(t.slug)
+    marcadas = [s for s in universo if s.session_id in nombran and s.session_id != yo]
+    if marcadas:
+        elegida = max(marcadas, key=lambda s: (mismo_cwd(s), s.mtime))
+        extra = "" if len(marcadas) == 1 else f", la mas reciente de {len(marcadas)}"
+        return (elegida.session_id, elegida.cuenta,
+                f"el slug aparece en su transcript{extra}")
+    cerca = sorted((s for s in universo if mismo_cwd(s)), key=lambda s: -s.mtime)
+    listado = "".join(
+        f"\n    {s.session_id}  {s.cuenta:<8} {s.mb:5.1f} MB  {s.dias}d  "
+        f"{s.titulo[:44] or 'sin titulo'}" for s in cerca[:6])
+    donde = (f"  Sesiones con cwd {e.cwd}:{listado}" if cerca
+             else f"  Ninguna sesion tiene cwd {e.cwd}.")
+    raise click.ClickException(
+        f"ninguna sesion nombra '{t.slug}' en su transcript, asi que no hay con "
+        "que saber cual hizo el trabajo. Adoptar la mas reciente del mismo cwd "
+        "es lo que hacia antes, y elige conversaciones ajenas.\n"
+        + donde
+        + "\n  Pasa el uuid, o --aqui si el trabajo sigue en esta sesion.")
+
+
 @cli.command("adoptar")
 @click.argument("slug")
 @click.argument("session_id", required=False)
 @click.option("--repo", help="Cuando el ticket tiene varios repos.")
 @click.option("--cuenta", type=click.Choice(list(CUENTAS)),
-              help="Buscar en esta cuenta y repuntar el ticket a ella.")
+              help="Restringir la busqueda a esta cuenta y repuntar el ticket a ella.")
+@click.option("--aqui", is_flag=True,
+              help="Adoptar la sesion desde la que se esta corriendo esto.")
 @click.option("--forzar", is_flag=True, help="Reemplazar un id que si existe en disco.")
 def adoptar_cmd(slug: str, session_id: str | None, repo: str | None,
-                cuenta: str | None, forzar: bool) -> None:
+                cuenta: str | None, aqui: bool, forzar: bool) -> None:
     """Registra en el ticket la sesion que hizo el trabajo de verdad.
 
     `new` reserva el uuid ANTES de que la sesion exista. Si el trabajo termino
     pasando por otra -- la que ya estaba abierta, un fork, una arrancada a mano
     -- el ticket apunta a un id que no esta en disco y `resume` abre una sesion
     nueva en vez de continuar: el modo de fallo exacto que factoria existe para
-    evitar. Sin argumento toma la sesion mas reciente del cwd registrado.
+    evitar.
 
-    `--cuenta` es el caso "la abri en la cuenta equivocada": los transcripts de
-    `dfv` y `personal` son directorios distintos y disjuntos (0 uuid en comun
-    sobre 337), asi que una sesion no se puede reanudar desde la otra cuenta
-    -- lo que se cambia es a que cuenta apunta el ticket.
+    Sin uuid la busca por evidencia: la sesion cuyo transcript nombra el slug.
+    Si ninguna lo nombra se niega y lista, en vez de adoptar la mas reciente del
+    mismo cwd, que puede ser -- y fue -- una conversacion ajena.
+
+    `--aqui` adopta la sesion desde la que se corre el comando, sin adivinar
+    nada. Es el caso "el ticket nacio en la otra cuenta y de aca en adelante se
+    trabaja en esta": los transcripts de `dfv` y `personal` son directorios
+    disjuntos (0 uuid en comun sobre 337), asi que la conversacion no se muda.
+    Lo que se muda es a que sesion y a que cuenta apunta el ticket; el trabajo
+    entra en la sesion nueva con `factoria contexto <slug>`.
     """
     t = buscar_ticket(slug)
     e = _entrada_unica(t, repo)
     cta = cuenta or e.cuenta
+    if aqui:
+        if session_id:
+            raise click.ClickException(
+                "--aqui y un uuid explicito son la misma decision dos veces: "
+                "pasa uno solo")
+        actual = sesion_actual()
+        if not actual:
+            raise click.ClickException(
+                "--aqui solo corre DENTRO de una sesion de Claude Code: no hay "
+                "CLAUDE_CODE_SESSION_ID en el entorno")
+        session_id, cta_aqui = actual
+        if cuenta and cuenta != cta_aqui:
+            raise click.ClickException(
+                f"esta sesion es de la cuenta {cta_aqui}, no {cuenta}: --aqui ya "
+                "define la cuenta, saca --cuenta")
+        cta = cta_aqui
     if session_id:
         nuevo = session_id
         if not jsonl_de(nuevo, cta):
             otra = next((c for c in CUENTAS if c != cta and jsonl_de(nuevo, c)), None)
             raise click.ClickException(
                 f"no hay .jsonl de {nuevo} en la cuenta {cta}. "
-                + (f"Si esta en '{otra}': agregá --cuenta {otra}"
+                + (f"Si esta en '{otra}': agrega --cuenta {otra}"
                    if otra else "Adoptar un id inexistente reproduce el problema "
                                 "que este comando arregla"))
     else:
-        objetivo = str(Path(e.cwd)).lower() if e.cwd else ""
-        porcuenta: dict[str, list] = {}
-        for s in inventario_sesiones():
-            if s.cwd and str(Path(s.cwd)).lower() == objetivo:
-                porcuenta.setdefault(s.cuenta, []).append(s)
-        cands = porcuenta.get(cta, [])
-        if not cands:
-            otras = ", ".join(f"{c} ({len(v)})" for c, v in porcuenta.items())
-            raise click.ClickException(
-                f"ninguna sesion de la cuenta {cta} tiene cwd {e.cwd}. "
-                + (f"Sí hay en: {otras}  ->  --cuenta <esa>" if otras
-                   else "Pasa el uuid a mano"))
-        nuevo = max(cands, key=lambda s: s.mtime).session_id
+        nuevo, cta, motivo = _elegir_sesion(t, e, cta, restringida=bool(cuenta))
+        console.print(f"  [dim]{motivo}[/]")
     previa, cuenta_previa = e.session_id, e.cuenta
     if nuevo == previa and cta == cuenta_previa:
         console.print(f"[dim]{t.slug}/{e.repo} ya apunta a {nuevo}.[/]")
         return
+    # Aviso y no error: una sesion sirviendo a dos tickets es un desorden real
+    # (`resume` de los dos cae en la misma conversacion, `cortar` uno corta el
+    # otro) pero pasa legitimamente cuando un ticket nace desde la sesion de
+    # otro. Con error obligaria a --forzar de rutina, y --forzar tambien apaga
+    # el guard de abajo, que importa mas: bypassear uno no puede bypassear los dos.
+    ajenos = sorted({x.slug for x in tickets_todos() if x.slug != t.slug
+                     for r in x.repos if r.session_id == nuevo})
+    if ajenos:
+        console.print(f"  [yellow]ojo:[/] {nuevo} ya es la sesion de "
+                      f"{', '.join(ajenos)}")
     # El guard mira la cuenta VIEJA, que es donde vive la sesion que se estaria
     # dejando sin ticket. Mirar la nueva lo desactiva justo cuando se cambia de
     # cuenta, que es cuando mas hace falta: ahi el .jsonl anterior nunca esta.
@@ -2288,8 +2412,11 @@ def adoptar_cmd(slug: str, session_id: str | None, repo: str | None,
         e.cuenta = cta
     e.session_id = nuevo
     escribir_ticket(t)
-    console.print(f"[bold]{t.slug}/{e.repo}[/]  sesion "
-                  f"{previa or '(ninguna)'} -> {nuevo}")
+    # Cuando solo cambio la cuenta, el "A -> A" es ruido: el cambio ya
+    # se imprimio arriba.
+    console.print(f"[bold]{t.slug}/{e.repo}[/]  " + (
+        f"sesion {previa or '(ninguna)'} -> {nuevo}" if nuevo != previa
+        else "misma sesion, ahora en la cuenta que la tiene"))
     if (j := jsonl_de(nuevo, cta)):
         tam = j.stat().st_size
         m = _meta_sesion(j, tam)
@@ -2312,6 +2439,10 @@ def adoptar_cmd(slug: str, session_id: str | None, repo: str | None,
         if mb > UMBRAL_SESION_MB:
             console.print(f"  [dim]pasa {UMBRAL_SESION_MB} MB: factoria cortar "
                           f"{t.slug} cuando quieras arrancar liviano.[/]")
+
+    if aqui:
+        console.print(f"  [dim]el trabajo del ticket todavia no esta en el "
+                      f"contexto de esta sesion: factoria contexto {t.slug}[/]")
 
 
 @cli.command("rama")
@@ -2706,6 +2837,32 @@ def contexto_cmd(slug: str, max_vecinos: int) -> None:
             razon = ", ".join(sorted(x.split("/", 1)[-1] for x in list(via)[:3]))
             partes += [f"### {w}", f"_comparte: {razon}_", "",
                        (est[:1200] or "_(sin seccion 'Estado actual')_"), ""]
+    # El doc de trabajo del PROPIO ticket. `contexto` emitia el estado de los
+    # vecinos y se salteaba el suyo, que es donde esta el trabajo hecho: el pack
+    # se quedaba corto justo en el ticket que se quiere retomar. Va el estado
+    # actual completo y de lo demas solo el indice, para leer una seccion en vez
+    # del doc entero -- el mismo criterio que INDICE.md, que se consulta y no se
+    # lee.
+    tk = next((x for x in tickets_todos() if f"ticket:{x.slug}" == nid), None)
+    propios = [Path(e.doc) for e in (tk.repos if tk else [])
+               if e.doc and Path(e.doc).is_file()]
+    if propios:
+        partes += ["---", "", "## Doc de trabajo", ""]
+        for dp in propios:
+            crudo = dp.read_text(encoding="utf-8", errors="replace")
+            lineas = crudo.splitlines()
+            partes += [f"### `{dp}`", "",
+                       _seccion(crudo, "## Estado actual").strip()
+                       or "_(sin seccion 'Estado actual')_", ""]
+            idx = [i for i, l in enumerate(lineas) if l.startswith("## ")]
+            resto = []
+            for k, i in enumerate(idx):
+                fin = idx[k + 1] if k + 1 < len(idx) else len(lineas)
+                nombre = lineas[i][3:].strip()
+                if nombre.lower() != "estado actual":
+                    resto.append(f"- `## {nombre}` ({fin - i - 1} lineas)")
+            if resto:
+                partes += ["_El resto del doc, por si hace falta:_", ""] + resto + [""]
     contratos = [v for v, t, _ in adyacentes(g, nid) if v.startswith("contrato:")]
     if contratos:
         partes += ["---", "", "## Contratos que toca", ""]
