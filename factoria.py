@@ -2093,6 +2093,66 @@ def _renombrar_rama(rp: Path, vieja: str, nueva: str) -> None:
                       "actualiza el registro del ticket.[/]")
 
 
+@cli.command("adoptar")
+@click.argument("slug")
+@click.argument("session_id", required=False)
+@click.option("--repo", help="Cuando el ticket tiene varios repos.")
+@click.option("--forzar", is_flag=True, help="Reemplazar un id que si existe en disco.")
+def adoptar_cmd(slug: str, session_id: str | None, repo: str | None, forzar: bool) -> None:
+    """Registra en el ticket la sesion que hizo el trabajo de verdad.
+
+    `new` reserva el uuid ANTES de que la sesion exista. Si el trabajo termino
+    pasando por otra -- la que ya estaba abierta, un fork, una arrancada a mano
+    -- el ticket apunta a un id que no esta en disco y `resume` abre una sesion
+    nueva en vez de continuar: el modo de fallo exacto que factoria existe para
+    evitar. Sin argumento toma la sesion mas reciente del cwd registrado.
+    """
+    t = buscar_ticket(slug)
+    e = _entrada_unica(t, repo)
+    if session_id:
+        nuevo = session_id
+        if not jsonl_de(nuevo, e.cuenta):
+            raise click.ClickException(
+                f"no hay .jsonl de {nuevo} en la cuenta {e.cuenta}. Adoptar un id "
+                "inexistente reproduce el problema que este comando arregla")
+    else:
+        objetivo = str(Path(e.cwd)).lower() if e.cwd else ""
+        cands = [s for s in inventario_sesiones()
+                 if s.cuenta == e.cuenta and s.cwd
+                 and str(Path(s.cwd)).lower() == objetivo]
+        if not cands:
+            raise click.ClickException(
+                f"ninguna sesion de la cuenta {e.cuenta} tiene cwd {e.cwd}. "
+                "Pasa el uuid a mano")
+        nuevo = max(cands, key=lambda s: s.mtime).session_id
+    if nuevo == e.session_id:
+        console.print(f"[dim]{t.slug}/{e.repo} ya apunta a {nuevo}.[/]")
+        return
+    previa = e.session_id
+    if previa and jsonl_de(previa, e.cuenta) and not forzar:
+        raise click.ClickException(
+            f"{previa} existe en disco: reemplazarla la deja sin ticket que la "
+            "encuentre. Repeti con --forzar si es lo que queres")
+    e.session_id = nuevo
+    escribir_ticket(t)
+    console.print(f"[bold]{t.slug}/{e.repo}[/]  sesion "
+                  f"{previa or '(ninguna)'} -> {nuevo}")
+    if (j := jsonl_de(nuevo, e.cuenta)):
+        tam = j.stat().st_size
+        m = _meta_sesion(j, tam)
+        mb = tam / 1_048_576
+        console.print(f"  [dim]{mb:.1f} MB · rama '{m['rama'] or '?'}' · "
+                      f"{m['titulo'] or 'sin titulo'}[/]")
+        if m["rama"] and e.rama and m["rama"] != e.rama:
+            # No se corrige en silencio: cual de las dos es la buena es una
+            # decision, y `rama` es el comando que la aplica en git tambien.
+            console.print(f"  [yellow]la sesion esta en '{m['rama']}' y el ticket "
+                          f"dice '{e.rama}'[/]: factoria rama {t.slug} <la correcta>")
+        if mb > UMBRAL_SESION_MB:
+            console.print(f"  [dim]pasa {UMBRAL_SESION_MB} MB: factoria cortar "
+                          f"{t.slug} cuando quieras arrancar liviano.[/]")
+
+
 @cli.command("rama")
 @click.argument("slug")
 @click.argument("nueva")
@@ -3032,7 +3092,9 @@ def check_cmd(slug: str | None, instalar_pre_push: bool) -> None:
 
     console.print()
     for l in lineas_ev:
-        console.print("  " + l.splitlines()[0])
+        # markup=False: estas lineas son para el archivo y arrancan con `[x]`
+        # o `[ ]`, que rich se come como si fuera un tag de estilo.
+        console.print("  " + l.splitlines()[0], markup=False)
     if not pf.get("verify"):
         console.print("[yellow]Este perfil no declara comandos `verify:`[/], asi que esto "
                       "solo verifico cotas y archivos protegidos.\n"
