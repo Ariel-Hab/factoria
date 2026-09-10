@@ -1961,6 +1961,38 @@ def cuerpo_issue(t: Ticket) -> str:
     return "\n".join(partes)
 
 
+def _estado_spec(t: Ticket) -> str:
+    """Que dice el tablero sobre el spec: es el gate que existe de verdad."""
+    if not t.spec_congelado:
+        return "sin aprobar"
+    return "aprobado" if huella_spec(t) == t.spec_congelado else "deriva"
+
+
+def _set_single_select(item: str, proyecto: str, campo: dict, valor: str,
+                       etiqueta: str) -> str | None:
+    """Mueve un single-select del Project. None si el campo no esta configurado.
+
+    Cada campo se reporta por separado en vez de abortar: el espejo es opcional,
+    y que falle mover `spec` no puede tapar que `fase` si se movio.
+    """
+    if not campo or not (opcion := (campo.get("opciones") or {}).get(valor)):
+        return None
+    rc, _, err = gh("project", "item-edit", "--id", item, "--project-id", proyecto,
+                    "--field-id", campo["id"], "--single-select-option-id", str(opcion))
+    return (f"{etiqueta} = {valor}" if rc == 0
+            else f"[yellow]no pude mover {etiqueta}: {err[:120]}[/]")
+
+
+def _labels_del_ticket(t: Ticket, cfg: dict) -> list[str]:
+    """Los repos van como label y no como campo del Project: un ticket cruza
+    repos por naturaleza y un single-select no puede tener N valores."""
+    lb = cfg.get("labels") or {}
+    pr, pc = lb.get("prefijo_repo", "repo:"), lb.get("prefijo_cuenta", "cuenta:")
+    nombres = {f"{pr}{e.repo}" for e in t.repos}
+    nombres |= {f"{pc}{e.cuenta}" for e in t.repos if e.cuenta}
+    return sorted(nombres)
+
+
 def espejar_si_se_puede(t: Ticket) -> None:
     """Espeja y persiste los ids, sin abortar el comando que llamo.
 
@@ -1993,17 +2025,23 @@ def espejar(t: Ticket, cfg: dict) -> list[str]:
     pr, campo = cfg["proyecto"], cfg["campo_fase"]
     hechos = []
 
+    etiquetas = _labels_del_ticket(t, cfg)
+    arg_labels = ["--label", ",".join(etiquetas)] if etiquetas else []
     if not t.issue:
         rc, out, err = gh("issue", "create", "--repo", repo,
-                          "--title", t.slug, "--body", cuerpo_issue(t))
+                          "--title", t.slug, "--body", cuerpo_issue(t), *arg_labels)
         if rc != 0:
             raise click.ClickException(f"gh issue create falló:\n{err[:400]}")
         t.issue_url = out.splitlines()[-1].strip()
         t.issue = int(t.issue_url.rstrip("/").rsplit("/", 1)[-1] or 0)
-        hechos.append(f"issue #{t.issue} creado")
+        hechos.append(f"issue #{t.issue} creado"
+                      + (f" ({', '.join(etiquetas)})" if etiquetas else ""))
     else:
+        # `--add-label` y no `--label`: sumar, no reemplazar, para no borrar una
+        # label puesta a mano en el issue.
+        add = ["--add-label", ",".join(etiquetas)] if etiquetas else []
         rc, _, err = gh("issue", "edit", str(t.issue), "--repo", repo,
-                        "--body", cuerpo_issue(t))
+                        "--body", cuerpo_issue(t), *add)
         hechos.append(f"issue #{t.issue} actualizado" if rc == 0
                       else f"[yellow]no pude actualizar el issue: {err[:120]}[/]")
 
@@ -2019,13 +2057,21 @@ def espejar(t: Ticket, cfg: dict) -> list[str]:
             raise click.ClickException(f"no pude leer el id del item:\n{out[:200]}")
         hechos.append("agregado al tablero")
 
-    opcion = (campo.get("opciones") or {}).get(t.fase)
-    if opcion:
+    for campo_cfg, valor, etiqueta in (
+        (campo, t.fase, "fase"),
+        (cfg.get("campo_spec"), _estado_spec(t), "spec"),
+        (cfg.get("campo_cuenta"), t.repos[0].cuenta if t.repos else "", "cuenta"),
+    ):
+        if (linea := _set_single_select(t.proyecto_item, pr["id"], campo_cfg,
+                                        valor, etiqueta)):
+            hechos.append(linea)
+
+    if (cr := cfg.get("campo_rama")) and (ramas := [e.rama for e in t.repos if e.rama]):
         rc, _, err = gh("project", "item-edit", "--id", t.proyecto_item,
-                        "--project-id", pr["id"], "--field-id", campo["id"],
-                        "--single-select-option-id", str(opcion))
-        hechos.append(f"fase = {t.fase}" if rc == 0
-                      else f"[yellow]no pude mover la tarjeta: {err[:120]}[/]")
+                        "--project-id", pr["id"], "--field-id", cr["id"],
+                        "--text", ", ".join(ramas))
+        hechos.append(f"rama = {', '.join(ramas)}" if rc == 0
+                      else f"[yellow]no pude escribir la rama: {err[:120]}[/]")
 
     if not t.abierto:
         rc, _, _ = gh("issue", "close", str(t.issue), "--repo", repo)
@@ -2965,6 +3011,9 @@ def aprobar_cmd(slug: str) -> None:
     escribir_ticket(t)
     regenerar_indice()
     console.print(f"[bold]{t.slug}[/] aprobado, huella {t.spec_congelado}")
+    # El tablero tiene un campo `spec`: sin esto quedaria diciendo "sin aprobar"
+    # hasta el proximo cambio de fase, que es justo el gate que `open` consulta.
+    espejar_si_se_puede(t)
     console.print("[dim]Si los criterios o el fuera de alcance cambian de ahora en mas, "
                   "`board` lo marca como spec-drift.[/]")
 
