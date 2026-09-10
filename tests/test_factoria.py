@@ -367,3 +367,16 @@ def test_el_umbral_esta_calibrado_y_no_estimado():
     sin la regla de payback que salio de la medicion."""
     assert fx.UMBRAL_SESION_MB == 1.0
     assert fx.TURNOS_PARA_QUE_CONVENGA == 3
+
+
+def test_tildar_un_criterio_no_es_spec_drift():
+    """Se aprueba al final de `plan` con todo en `[ ]`, y cada `[x]` de dev/test
+    disparaba deriva: el gate acusaba a quien lo estaba cumpliendo."""
+    base = ("## Criterios de aceptación\n- [ ] uno\n- [ ] dos\n\n"
+            "## Fuera de alcance\n- nada\n")
+    a = fx.Ticket(slug="x", cuerpo=base)
+    b = fx.Ticket(slug="x", cuerpo=base.replace("- [ ] uno", "- [x] uno"))
+    assert fx.huella_spec(a) == fx.huella_spec(b)
+    # pero editar el TEXTO de un criterio si tiene que saltar
+    c = fx.Ticket(slug="x", cuerpo=base.replace("- [ ] uno", "- [ ] uno y medio"))
+    assert fx.huella_spec(a) != fx.huella_spec(c)

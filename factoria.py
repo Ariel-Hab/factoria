@@ -3257,13 +3257,26 @@ o lo deja en el archivo que `factoria commit --seco` te muestra.
 # requerimiento antes del codigo.
 # --------------------------------------------------------------------------
 
+# El checkbox se normaliza antes de hashear la huella: ver huella_spec.
+RE_TILDE = re.compile(r"^(\s*[-*]\s*\[)[xX](\])", re.M)
+
+
 def huella_spec(t: Ticket) -> str:
     """Hash de criterios + fuera de alcance. Es una constancia, no una firma:
-    su valor es que la deriva se vuelve detectable."""
+    su valor es que la deriva se vuelve detectable.
+
+    Tildar un criterio NO cuenta: es progreso, no un cambio de spec. Sin
+    normalizar el checkbox la deriva saltaba en el camino normal -- se aprueba
+    al final de `plan` con todo en `[ ]` y cada `[x]` de `dev`/`test` la
+    disparaba, o sea que el gate acusaba de cambiar el spec justamente a quien
+    lo estaba cumpliendo. Editar el TEXTO de un criterio si sigue siendo
+    deriva, que es lo que el gate existe para ver.
+    """
     import hashlib
     material = "\n".join(
         _seccion(t.cuerpo, e) for e in ("## Criterios de aceptación", "## Fuera de alcance")
     )
+    material = RE_TILDE.sub(r"\1 \2", material)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
