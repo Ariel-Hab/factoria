@@ -129,3 +129,18 @@ def test_entrada_por_nombre_de_repo_es_exacta():
     import pytest as _p
     with _p.raises(Exception):
         fx._entrada_unica(t, "factoria", exacto=True)
+
+
+def test_adoptar_no_huerfana_al_cambiar_de_cuenta():
+    """El guard de `adoptar` mira la cuenta VIEJA, no la nueva.
+
+    Los transcripts de dfv y personal son directorios disjuntos, asi que al
+    cambiar de cuenta el .jsonl previo nunca esta en la nueva: mirar ahi
+    desactiva el guard justo cuando mas hace falta.
+    """
+    fuente = FUENTE.read_text(encoding="utf-8")
+    i = fuente.index("def adoptar_cmd")
+    j = fuente.index("@cli.command", i)
+    cuerpo = fuente[i:j]
+    assert "jsonl_de(previa, cuenta_previa)" in cuerpo
+    assert "jsonl_de(previa, cta)" not in cuerpo

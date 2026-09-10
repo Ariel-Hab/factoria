@@ -66,6 +66,17 @@ factoria contexto rediseno-home      # el pack mínimo para arrancar fresco: tic
 `new` lo reserva antes de que la sesión exista, así que si el trabajo pasó por
 otra (un fork, una que ya estaba abierta), `resume` abriría una vacía.
 
+**Las cuentas `dfv` y `personal` son transcripts disjuntos** (dos directorios
+distintos, 0 uuid en común sobre 337): una sesión **no se puede reanudar desde
+la otra cuenta**. Lo que se cambia es a qué cuenta apunta el ticket.
+
+```bash
+factoria resume <slug> --cuenta personal      # FILTRA las entradas del ticket, no cambia de cuenta
+factoria adoptar <slug> --cuenta personal     # "la abrí en la cuenta equivocada": repunta el ticket
+factoria open <slug> --repo R --cuenta personal   # una entrada NUEVA, con su propia sesión
+factoria contexto <slug>                      # el trabajo, no la conversación: arrancar fresco donde sea
+```
+
 ## Mirar el estado
 
 ```bash

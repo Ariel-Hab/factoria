@@ -2182,8 +2182,11 @@ def cotas_cmd(contratos: bool, tickets: bool, docs: bool) -> None:
 @click.argument("slug")
 @click.argument("session_id", required=False)
 @click.option("--repo", help="Cuando el ticket tiene varios repos.")
+@click.option("--cuenta", type=click.Choice(list(CUENTAS)),
+              help="Buscar en esta cuenta y repuntar el ticket a ella.")
 @click.option("--forzar", is_flag=True, help="Reemplazar un id que si existe en disco.")
-def adoptar_cmd(slug: str, session_id: str | None, repo: str | None, forzar: bool) -> None:
+def adoptar_cmd(slug: str, session_id: str | None, repo: str | None,
+                cuenta: str | None, forzar: bool) -> None:
     """Registra en el ticket la sesion que hizo el trabajo de verdad.
 
     `new` reserva el uuid ANTES de que la sesion exista. Si el trabajo termino
@@ -2191,38 +2194,57 @@ def adoptar_cmd(slug: str, session_id: str | None, repo: str | None, forzar: boo
     -- el ticket apunta a un id que no esta en disco y `resume` abre una sesion
     nueva en vez de continuar: el modo de fallo exacto que factoria existe para
     evitar. Sin argumento toma la sesion mas reciente del cwd registrado.
+
+    `--cuenta` es el caso "la abri en la cuenta equivocada": los transcripts de
+    `dfv` y `personal` son directorios distintos y disjuntos (0 uuid en comun
+    sobre 337), asi que una sesion no se puede reanudar desde la otra cuenta
+    -- lo que se cambia es a que cuenta apunta el ticket.
     """
     t = buscar_ticket(slug)
     e = _entrada_unica(t, repo)
+    cta = cuenta or e.cuenta
     if session_id:
         nuevo = session_id
-        if not jsonl_de(nuevo, e.cuenta):
+        if not jsonl_de(nuevo, cta):
+            otra = next((c for c in CUENTAS if c != cta and jsonl_de(nuevo, c)), None)
             raise click.ClickException(
-                f"no hay .jsonl de {nuevo} en la cuenta {e.cuenta}. Adoptar un id "
-                "inexistente reproduce el problema que este comando arregla")
+                f"no hay .jsonl de {nuevo} en la cuenta {cta}. "
+                + (f"Si esta en '{otra}': agregá --cuenta {otra}"
+                   if otra else "Adoptar un id inexistente reproduce el problema "
+                                "que este comando arregla"))
     else:
         objetivo = str(Path(e.cwd)).lower() if e.cwd else ""
-        cands = [s for s in inventario_sesiones()
-                 if s.cuenta == e.cuenta and s.cwd
-                 and str(Path(s.cwd)).lower() == objetivo]
+        porcuenta: dict[str, list] = {}
+        for s in inventario_sesiones():
+            if s.cwd and str(Path(s.cwd)).lower() == objetivo:
+                porcuenta.setdefault(s.cuenta, []).append(s)
+        cands = porcuenta.get(cta, [])
         if not cands:
+            otras = ", ".join(f"{c} ({len(v)})" for c, v in porcuenta.items())
             raise click.ClickException(
-                f"ninguna sesion de la cuenta {e.cuenta} tiene cwd {e.cwd}. "
-                "Pasa el uuid a mano")
+                f"ninguna sesion de la cuenta {cta} tiene cwd {e.cwd}. "
+                + (f"Sí hay en: {otras}  ->  --cuenta <esa>" if otras
+                   else "Pasa el uuid a mano"))
         nuevo = max(cands, key=lambda s: s.mtime).session_id
-    if nuevo == e.session_id:
+    previa, cuenta_previa = e.session_id, e.cuenta
+    if nuevo == previa and cta == cuenta_previa:
         console.print(f"[dim]{t.slug}/{e.repo} ya apunta a {nuevo}.[/]")
         return
-    previa = e.session_id
-    if previa and jsonl_de(previa, e.cuenta) and not forzar:
+    # El guard mira la cuenta VIEJA, que es donde vive la sesion que se estaria
+    # dejando sin ticket. Mirar la nueva lo desactiva justo cuando se cambia de
+    # cuenta, que es cuando mas hace falta: ahi el .jsonl anterior nunca esta.
+    if previa and jsonl_de(previa, cuenta_previa) and not forzar:
         raise click.ClickException(
-            f"{previa} existe en disco: reemplazarla la deja sin ticket que la "
-            "encuentre. Repeti con --forzar si es lo que queres")
+            f"{previa} existe en disco (cuenta {cuenta_previa}): reemplazarla la "
+            "deja sin ticket que la encuentre. Repeti con --forzar si es lo que queres")
+    if cta != cuenta_previa:
+        console.print(f"  [dim]cuenta {cuenta_previa} -> {cta}[/]")
+        e.cuenta = cta
     e.session_id = nuevo
     escribir_ticket(t)
     console.print(f"[bold]{t.slug}/{e.repo}[/]  sesion "
                   f"{previa or '(ninguna)'} -> {nuevo}")
-    if (j := jsonl_de(nuevo, e.cuenta)):
+    if (j := jsonl_de(nuevo, cta)):
         tam = j.stat().st_size
         m = _meta_sesion(j, tam)
         mb = tam / 1_048_576
