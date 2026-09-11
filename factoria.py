@@ -34,6 +34,9 @@ from rich.table import Table
 # --------------------------------------------------------------------------
 ARIEL = Path(r"C:\ariel")
 DATOS = ARIEL / ".factoria"
+# DemandSync (UTN, Equipo 207) es hermano de dfv/ e integhra/, no esta anidado en
+# ninguna de las dos -- mismo motivo que DATOS, va explicito (2026-09-10).
+DEMANDSYNC = ARIEL / "demandsync"
 CONTRATOS = ARIEL / "dfv" / ".contracts"
 # Derivado: lo reescribe cada sesion fresca. Ignorado en el repo de datos.
 CONTEXTOS = DATOS / "contexto"
@@ -120,6 +123,10 @@ def descubrir_repos() -> list[Path]:
     # no tienen donde correr.
     if (DATOS / ".git").exists():
         repos.append(DATOS)
+    # DemandSync (UTN, Equipo 207): mismo motivo que DATOS. No esta bajo ninguna
+    # RAIZ, es un repo real con remoto y trabajo real.
+    if (DEMANDSYNC / ".git").exists():
+        repos.append(DEMANDSYNC)
     return repos
 
 
