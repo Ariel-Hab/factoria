@@ -1656,6 +1656,9 @@ CUERPO_TICKET = """# {slug}
      cuestan lo mismo de revisar. Sin firmas ni snippets: si necesitas codigo
      para explicarlo, va al doc de trabajo. Si no sabes como nombrarlo no es
      un entregable, es implementacion. Mas de 7 y el ticket son dos tickets.
+     Si la unidad declara permisos, el ROL o tipo de usuario permitido va en la
+     misma linea: "solo rol admin", "cualquier usuario autenticado", "publico".
+     Un permiso sin rol es un permiso que nadie puede revisar.
      En tickets multi-repo, prefijo [repo] en cada linea. -->
 
 -

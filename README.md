@@ -84,8 +84,14 @@ Cuatro secciones, y las tres primeras `aprobar` las exige no vacías:
   ```markdown
   - **nuevo** servicio `AuthService` — emite y valida el token
   - **modifica** `LoginController` — delega en AuthService, saca el check inline
+  - **nuevo** endpoint `GET /api/usuarios` — solo rol `admin`
   - **nueva** tabla `usuario_sesion`
   ```
+
+  **Si la unidad declara permisos, el rol o tipo de usuario permitido va en la
+  misma línea** — `solo rol admin`, `cualquier usuario autenticado`, `público`.
+  Un permiso sin rol declarado no se puede revisar: es de las pocas cosas que,
+  mal interpretadas, no se ven hasta que ya están en producción.
 
   Si no sabés cómo nombrarlo no es un entregable, es implementación; y si pasás
   de ~7 bullets el ticket son dos tickets. Nada de firmas ni de snippets: para
