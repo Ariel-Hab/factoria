@@ -390,3 +390,63 @@ def test_toda_sesion_arranca_con_el_repo_de_datos_habilitado():
     assert '"--add-dir", str(DATOS)' in src
     i, j = src.index("--add-dir"), src.index("list2cmdline")
     assert i < j, "tiene que entrar en args ANTES de armar la receta"
+
+
+# --------------------------------------------------------------------------
+# Entregables de código: el QUE se toca, declarado antes de que exista
+# --------------------------------------------------------------------------
+
+def test_los_entregables_no_entran_en_la_huella():
+    """Es el DONDE, no el que. Descubrir superficie nueva en `dev` pasa casi
+    siempre; si eso pintara spec-drift el gate seria ruido y se ignoraria, que
+    es exactamente lo que le paso al checkbox."""
+    base = ("## Criterios de aceptación\n- [ ] uno\n\n"
+            "## Fuera de alcance\n- nada\n\n"
+            "## Entregables de código\n- **nuevo** servicio `AuthService`\n")
+    a = fx.Ticket(slug="x", cuerpo=base)
+    b = fx.Ticket(slug="x", cuerpo=base + "- **nueva** tabla `usuario_sesion`\n")
+    assert fx.huella_spec(a) == fx.huella_spec(b)
+
+
+def test_la_plantilla_trae_todo_lo_que_aprobar_exige():
+    """Si `new` escribiera un ticket al que le falta un encabezado exigido,
+    ningun ticket nuevo se podria aprobar sin pegarlo a mano."""
+    for enc in fx.EXIGIDAS_PARA_APROBAR:
+        assert enc in fx.CUERPO_TICKET, enc
+
+
+def test_aprobar_exige_los_entregables_de_codigo(monkeypatch):
+    """Criterios y fuera de alcance ya bloqueaban; entregables tambien, porque
+    sin el la seccion es un renglon opcional que se llena de compromiso."""
+    t = fx.Ticket(slug="x", cuerpo=("## Criterios de aceptación\n- [ ] uno\n\n"
+                                    "## Fuera de alcance\n- nada\n\n"
+                                    "## Entregables de código\n\n-\n"))
+    monkeypatch.setattr(fx, "buscar_ticket", lambda _s: t)
+    r = CliRunner().invoke(fx.cli, ["aprobar", "x"])
+    assert r.exit_code != 0
+    assert "Entregables de código" in r.output
+    assert not t.spec_congelado
+
+
+def test_aprobar_distingue_seccion_vacia_de_ausente(monkeypatch):
+    """Un ticket anterior a la plantilla no tiene el encabezado, y decirle
+    'esta vacia' lo manda a buscar algo que no esta: una se llena, la otra se
+    pega."""
+    viejo = fx.Ticket(slug="x", cuerpo=("## Criterios de aceptación\n- [ ] uno\n\n"
+                                        "## Fuera de alcance\n- nada\n"))
+    monkeypatch.setattr(fx, "buscar_ticket", lambda _s: viejo)
+    r = CliRunner().invoke(fx.cli, ["aprobar", "x"])
+    assert "ausentes" in r.output and "vacias" not in r.output
+
+    vacio = fx.Ticket(slug="x", cuerpo=viejo.cuerpo + "\n## Entregables de código\n\n-\n")
+    monkeypatch.setattr(fx, "buscar_ticket", lambda _s: vacio)
+    r = CliRunner().invoke(fx.cli, ["aprobar", "x"])
+    assert "vacias" in r.output and "ausentes" not in r.output
+
+
+def test_el_issue_espeja_los_entregables():
+    """El issue se regenera entero: una seccion que no este en la lista
+    desaparece del espejo sin que nada falle."""
+    t = fx.Ticket(slug="x", cuerpo=("## Entregables de código\n"
+                                    "- **nuevo** servicio `AuthService`\n"))
+    assert "AuthService" in fx.cuerpo_issue(t)

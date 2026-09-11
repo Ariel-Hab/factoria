@@ -37,7 +37,7 @@ factoria close probar             # pushea, archiva, imprime el compare
 ```mermaid
 flowchart TD
     N["<b>new</b><br/>ticket + rama + sesión"] --> P
-    P["<b>fase: plan</b><br/>criterios de aceptación<br/>supuestos abiertos"]
+    P["<b>fase: plan</b><br/>criterios · entregables<br/>supuestos abiertos"]
     P -->|"<b>aprobar</b><br/>congela la huella"| AP{{"spec aprobado"}}
     AP -->|"<b>open --repo R2</b><br/>se niega sin aprobar"| P2["2º repo<br/>sesión propia"]
     AP --> D["<b>fase: dev</b><br/>commit · commit · commit"]
@@ -56,7 +56,7 @@ Los comandos, en el orden en que se usan:
 | Paso | Comando | Qué pasa |
 |---|---|---|
 | 1 | `new <slug> --repo R` | ticket en `fase: plan`, **rama nueva** `<tipo>/<slug>`, sesión con uuid conocido, issue + tarjeta |
-| 2 | *(en la sesión)* | se escriben `## Criterios de aceptación` y `## Supuestos abiertos` |
+| 2 | *(en la sesión)* | se escriben `## Criterios de aceptación`, `## Entregables de código` y `## Supuestos abiertos` |
 | 3 | `aprobar <slug>` | congela la huella de criterios + fuera de alcance |
 | 4 | `open <slug> --repo R2` | suma un 2º repo con su propia sesión. **Se niega si no está aprobado** |
 | 5 | `commit --mensaje "…"` | valida `<tipo>: <imperativo>` ≤60 chars, protege ramas y archivos |
@@ -66,6 +66,38 @@ Los comandos, en el orden en que se usan:
 
 Flags de `new` que importan: `--aqui` (no crear rama, usar la actual),
 `--pedido "…"` (en vez de abrir el editor), `--no-lanzar`, `--tipo fix|chore`.
+
+### Qué se declara en `plan`
+
+Cuatro secciones, y las tres primeras `aprobar` las exige no vacías:
+
+- **`## Pedido crudo`** — literal, como llegó. Se escribe una vez y no se toca
+  más: es contra lo que se compara si después hubo malentendido.
+- **`## Criterios de aceptación`** — cada uno respondible con sí/no y nombrando
+  *su* evidencia. "funciona bien" no es un criterio.
+- **`## Fuera de alcance`** — lo que se decidió NO hacer.
+- **`## Entregables de código`** — qué se va a tocar, **por unidad con nombre en
+  el sistema**: un servicio, un endpoint, una tabla, una pantalla, un job. Con
+  el verbo adelante, porque crear y tocar algo preexistente no cuestan lo mismo
+  de revisar:
+
+  ```markdown
+  - **nuevo** servicio `AuthService` — emite y valida el token
+  - **modifica** `LoginController` — delega en AuthService, saca el check inline
+  - **nueva** tabla `usuario_sesion`
+  ```
+
+  Si no sabés cómo nombrarlo no es un entregable, es implementación; y si pasás
+  de ~7 bullets el ticket son dos tickets. Nada de firmas ni de snippets: para
+  eso está el doc de trabajo.
+- **`## Supuestos abiertos`** — cada cosa que el modelo tuvo que adivinar,
+  escrita **como adivinanza**. Acá `aprobar` avisa pero no bloquea: un ticket
+  sin supuestos es sospechoso, no inválido.
+
+**La huella que congela `aprobar` es criterios + fuera de alcance, y nada más.**
+Los entregables se exigen pero no se congelan a propósito: son el *dónde*, no el
+*qué*, y descubrir superficie nueva durante `dev` es sano. Pintarlo de
+spec-drift rojo convertiría el gate en ruido.
 
 ### Cerrar sin pushear
 
@@ -186,7 +218,7 @@ matter del ticket:
 | `repos[].cuenta` | campo `cuenta` + label `cuenta:dfv` |
 | `repos[].rama` | campo `rama` |
 | `repos[].repo` | labels `repo:defeve`, `repo:Cotizaciones`… |
-| pedido, criterios, fuera de alcance, supuestos | cuerpo del issue, regenerado |
+| pedido, criterios, fuera de alcance, entregables, supuestos | cuerpo del issue, regenerado |
 | `abierto: false` | issue cerrado |
 
 Los repos van como **label** y no como campo del Project porque un ticket cruza

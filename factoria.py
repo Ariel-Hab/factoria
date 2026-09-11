@@ -1648,6 +1648,18 @@ CUERPO_TICKET = """# {slug}
 
 -
 
+## Entregables de código
+
+<!-- Que se va a tocar, por unidad con NOMBRE en el sistema: un servicio, un
+     endpoint, una tabla, una pantalla, un job, un comando. Verbo adelante
+     --nuevo, modifica, borra-- porque crear y tocar algo preexistente no
+     cuestan lo mismo de revisar. Sin firmas ni snippets: si necesitas codigo
+     para explicarlo, va al doc de trabajo. Si no sabes como nombrarlo no es
+     un entregable, es implementacion. Mas de 7 y el ticket son dos tickets.
+     En tickets multi-repo, prefijo [repo] en cada linea. -->
+
+-
+
 ## Supuestos abiertos
 
 <!-- Cada cosa que el modelo tuvo que adivinar, escrita COMO adivinanza y antes
@@ -1689,6 +1701,12 @@ Nada ejecutado todavia.
 
 -
 """
+
+
+# Las tres que `aprobar` exige no vacias. `Supuestos abiertos` NO esta: ahi
+# avisa y sigue, porque un ticket sin supuestos es sospechoso pero no invalido.
+EXIGIDAS_PARA_APROBAR = ("## Criterios de aceptación", "## Fuera de alcance",
+                         "## Entregables de código")
 
 
 def crear_doc(repo: str, slug: str) -> Path:
@@ -1865,7 +1883,8 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     console.print(f"  sesion   {sid}")
     console.print(f"  rama     {rama or '(sin rama)'}")
     console.print()
-    console.print("[dim]En la sesion: escribí los criterios de aceptación y, sobre todo, "
+    console.print("[dim]En la sesion: escribí los criterios de aceptación, los entregables "
+                  "de código y, sobre todo, "
                   "los supuestos abiertos.\nEsa seccion vacía en fase plan significa que "
                   "no se entendió el pedido.[/]")
     console.print()
@@ -2140,7 +2159,8 @@ def cuerpo_issue(t: Ticket) -> str:
     for e in t.repos:
         partes.append(f"- `{e.repo}` ({e.cuenta}) — rama `{e.rama or '?'}`")
     for enc in ("## Pedido crudo", "## Criterios de aceptación",
-                "## Fuera de alcance", "## Supuestos abiertos"):
+                "## Fuera de alcance", "## Entregables de código",
+                "## Supuestos abiertos"):
         cuerpo = _seccion(t.cuerpo, enc)
         partes += ["", enc.replace("## ", "### "), "", cuerpo or "_(vacío)_"]
     return "\n".join(partes)
@@ -3285,6 +3305,11 @@ def huella_spec(t: Ticket) -> str:
     disparaba, o sea que el gate acusaba de cambiar el spec justamente a quien
     lo estaba cumpliendo. Editar el TEXTO de un criterio si sigue siendo
     deriva, que es lo que el gate existe para ver.
+
+    `## Entregables de código` tampoco entra, y a proposito: es el DONDE, no el
+    que. Descubrir superficie nueva durante `dev` es sano y pasa casi siempre;
+    pintarlo de spec-drift rojo convertiria el gate en ruido -- el mismo error
+    que el checkbox, un escalon mas arriba.
     """
     import hashlib
     material = "\n".join(
@@ -3312,14 +3337,21 @@ def url_compare(rp: Path, base: str, rama: str) -> str:
 def aprobar_cmd(slug: str) -> None:
     """Congela criterios y fuera de alcance. Habilita `open` en otros repos."""
     t = buscar_ticket(slug)
-    faltan = [e for e in ("## Criterios de aceptación", "## Fuera de alcance")
-              if not _tiene_items(t.cuerpo, e)]
+    faltan = [e for e in EXIGIDAS_PARA_APROBAR if not _tiene_items(t.cuerpo, e)]
     if faltan:
-        raise click.ClickException(
-            "no puedo aprobar un spec con secciones vacias: "
-            + ", ".join(f.replace("## ", "") for f in faltan)
-            + f"\nEditá {t.path} y volvé a correr."
-        )
+        # Vacia y ausente son dos arreglos distintos: una se llena, la otra se
+        # pega. Un ticket anterior a que existiera `Entregables de código` no la
+        # tiene, y decirle "esta vacia" lo manda a buscar algo que no esta.
+        encabezados = {l.strip() for l in t.cuerpo.splitlines()}
+        ausentes = [e for e in faltan if e not in encabezados]
+        msg = ["no puedo aprobar un spec incompleto:"]
+        if vacias := [e for e in faltan if e not in ausentes]:
+            msg.append("  vacias:   " + ", ".join(e.removeprefix("## ") for e in vacias))
+        if ausentes:
+            msg.append("  ausentes: " + ", ".join(e.removeprefix("## ") for e in ausentes)
+                       + "   (ticket anterior a la plantilla: pegá el encabezado)")
+        msg.append(f"Editá {t.path} y volvé a correr.")
+        raise click.ClickException("\n".join(msg))
     if not _tiene_items(t.cuerpo, "## Supuestos abiertos"):
         console.print("[yellow]Ojo:[/] 'Supuestos abiertos' esta vacio. Eso no significa "
                       "que no haya supuestos, significa que no se escribieron.\n")
