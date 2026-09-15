@@ -5,7 +5,7 @@
 artefactos que ya existen (branches, worktrees, docs de trabajo, sesiones,
 contratos) y reporta las cotas violadas.
 
-`sesiones` / `resume` / `cortar` (paso 3) indexan las sesiones de los dos
+`sesiones` / `resume` (paso 3) indexan las sesiones de los dos
 config dirs y reanudan la correcta, con su cuenta y su cwd. El indice es
 derivado: se reconstruye leyendo los .jsonl en cada corrida, asi que no hay
 estado que se pueda desincronizar.
@@ -685,7 +685,7 @@ def hallazgos(rel: Relevamiento) -> list[str]:
             + (f" y {len(caras) - 3} mas" if len(caras) > 3 else "")
             + f". El tamano de aca en mas no cambia el costo, asi que no hay una "
               f"mas urgente que otra: cortar la que vayas a seguir mas de "
-              f"{TURNOS_PARA_QUE_CONVENGA} turnos  ->  factoria cortar <rama> --fork"
+              f"{TURNOS_PARA_QUE_CONVENGA} turnos  ->  factoria resume <rama> --fork"
         )
 
     # El agujero de trazabilidad: una tarea con N conversaciones y ningun indice.
@@ -931,7 +931,7 @@ def board(docs: bool, ramas: bool, sesiones: bool, limite: int, como_json: bool)
 
 
 # --------------------------------------------------------------------------
-# Sesiones: inventario, resume, cortar (paso 3)
+# Sesiones: inventario, resume, adoptar (paso 3)
 # --------------------------------------------------------------------------
 
 def _render_sesiones(ss: list[Sesion], encabezado: str = "") -> None:
@@ -1037,10 +1037,17 @@ def _elegir_una(ss: list[Sesion], consulta: str, elegir: int | None,
 @click.option("--limite", default=20, show_default=True, help="Filas.")
 @click.option("--paralelas", is_flag=True,
               help="Solo ramas con MAS DE UNA sesion: el agujero de trazabilidad.")
+@click.option("--ticket", "slug_ticket",
+              help="Las sesiones que tocaron ese ticket, por evidencia: el slug "
+                   "aparece en su transcript. Marca cual es la responsable.")
 @click.option("--json", "como_json", is_flag=True, help="Volcado crudo.")
 def sesiones(repo: str | None, rama: str | None, cuenta: str | None, dias: int,
-             limite: int, paralelas: bool, como_json: bool) -> None:
+             limite: int, paralelas: bool, slug_ticket: str | None,
+             como_json: bool) -> None:
     """Inventario de sesiones con su repo, rama, titulo y tamano. Solo lectura."""
+    if slug_ticket:
+        _sesiones_del_ticket(slug_ticket)
+        return
     ss = inventario_sesiones()
     total = len(ss)
     if cuenta:
@@ -1101,9 +1108,52 @@ def sesiones(repo: str | None, rama: str | None, cuenta: str | None, dias: int,
     console.print()
 
 
+def _sesiones_del_ticket(slug: str) -> None:
+    """Que sesiones tocaron el ticket, segun el disco y segun el ticket.
+
+    Barrer los 337 transcripts buscando el slug son 359 MB y 0,7 s. Vive aca y
+    no adentro de `adoptar` porque es una PREGUNTA, no una decision: que la
+    respuesta eligiera sola a quien adoptar fue como se adopto una conversacion
+    ajena que solo habia pasado por el mismo cwd.
+
+    Sirve sobre todo para los tickets anteriores al historial, que no tienen
+    anotado por donde pasaron.
+    """
+    t = buscar_ticket(slug)
+    registradas = {s.id: e for e in t.repos for s in e.sesiones}
+    nombran = sesiones_que_nombran(t.slug)
+    yo = (sesion_actual() or ("", ""))[0]
+    ss = [s for s in inventario_sesiones()
+          if s.session_id in nombran or s.session_id in registradas]
+    console.print()
+    console.print(f"[bold]Sesiones de {t.slug}[/]  |  {len(ss)} "
+                  f"({len(registradas)} anotadas en el ticket)")
+    if not ss:
+        console.print(f"  [dim]ninguna sesion nombra '{t.slug}' ni esta anotada.[/]")
+        console.print()
+        return
+    for s in sorted(ss, key=lambda x: -x.mtime):
+        e = registradas.get(s.session_id)
+        if e and e.session_id == s.session_id:
+            marca = f"[green]responsable[/] {e.repo}"
+        elif e:
+            marca = f"[dim]asociada {e.repo}[/]"
+        elif s.session_id == yo:
+            marca = "[yellow]esta sesion[/]"
+        else:
+            marca = "[dim]sin anotar[/]"
+        console.print(f"  {s.session_id}  {s.cuenta:<8} {s.mb:5.1f} MB  {s.dias:>2}d  "
+                      f"{marca}")
+        console.print(f"    [dim]{s.rama or '(sin rama)'} · "
+                      f"{s.titulo[:60] or 'sin titulo'}[/]")
+    console.print(f"  [dim]adoptar la que corresponda: factoria adoptar {t.slug} "
+                  "<uuid>  (o --aqui si estas adentro)[/]")
+    console.print()
+
+
 @dataclass
 class Destino:
-    """A donde apunta un `resume`/`cortar`, venga de un ticket o de una busqueda."""
+    """A donde apunta un `resume`, venga de un ticket o de una busqueda."""
     cuenta: str
     cwd: str
     session_id: str
@@ -1112,7 +1162,7 @@ class Destino:
     mb: float = 0.0
     origen: str = "sesion"
     # Cuando el destino salio de un ticket, quien lo resolvio ya lo tiene: sin
-    # esto `cortar` tenia que volver a parsear `origen` para encontrarlo.
+    # esto habia que volver a parsear `origen` para encontrarlo.
     ticket: Ticket | None = None
     entrada: RepoTicket | None = None
 
@@ -1194,8 +1244,9 @@ def resolver_destino(consulta: str, repo: str | None, cuenta: str | None,
                 f"el ticket '{t.slug}' no tiene entrada para esos filtros. Repos: "
                 + ", ".join(f"{e.repo}({e.cuenta})" for e in t.repos)
                 + (f"\nLos transcripts de las dos cuentas son disjuntos, asi que en "
-                   f"{cuenta} no hay conversacion que continuar. Para trabajarlo ahi:"
-                   f"\n  factoria resume {t.slug} --nueva --cuenta {cuenta}"
+                   f"{cuenta} no hay conversacion que continuar. Para que ese lado "
+                   f"agarre el ticket:"
+                   f"\n  factoria adoptar {t.slug} --cuenta {cuenta}"
                    if cuenta else "")
             )
         if len(entradas) > 1:
@@ -1225,18 +1276,27 @@ def _arrancar_fresca(t: Ticket, e: RepoTicket, cuenta: str,
                      imprimir: bool, forzar: bool) -> None:
     """Sesion nueva para un ticket que ya existe: la registra y le pasa el pack.
 
-    Es lo que faltaba para que "seguir este ticket en la otra cuenta" sea un
-    comando y no un ritual de tres pasos. Dos cosas que no puede saltear:
-    registrar el uuid ANTES de lanzar, porque si no la sesion nace huerfana y
-    `resume` vuelve a abrir cualquier cosa; y pasarle el pack de contexto,
-    porque una sesion fresca no sabe nada del ticket.
+    Es el motor de `adoptar --cuenta` y de `resume --nueva`. Dos cosas que no
+    puede saltear: registrar el uuid ANTES de lanzar, porque si no la sesion
+    nace huerfana y `resume` vuelve a abrir cualquier cosa; y pasarle el pack de
+    contexto, porque una sesion fresca no sabe nada del ticket.
 
-    Si al final no se lanzo nada, el registro se revierte: dejar escrito un uuid
-    que nadie va a abrir es exactamente el fantasma que `adoptar` viene a
-    arreglar.
+    La sesion que deja de ser responsable NO se borra del ticket: queda
+    asociada. Esa es la diferencia con el modelo viejo, donde cambiar de sesion
+    responsable perdia la referencia a la anterior y no habia forma de volver.
+
+    Si al final no se lanzo nada, el registro se revierte entero: dejar escrito
+    un uuid que nadie va a abrir es un fantasma, y `--aqui` es el camino para
+    registrar la sesion recien cuando de verdad existe.
     """
     nuevo = str(uuid.uuid4())
     previa, cuenta_previa = e.session_id, e.cuenta
+    antes = list(e.sesiones)
+
+    def revertir() -> None:
+        e.session_id, e.cuenta, e.sesiones = previa, cuenta_previa, antes
+        escribir_ticket(t)
+
     CONTEXTOS.mkdir(parents=True, exist_ok=True)
     pack = CONTEXTOS / f"{t.slug}.md"
     pack.write_text(pack_de_contexto(t.slug), encoding="utf-8")
@@ -1249,27 +1309,28 @@ def _arrancar_fresca(t: Ticket, e: RepoTicket, cuenta: str,
     console.print(f"[bold]{t.slug}/{e.repo}[/]  sesion nueva {nuevo} [dim]({cuenta})[/]")
     console.print(f"  [dim]pack: {pack}[/]")
     if previa:
-        console.print(
-            f"  [dim]la anterior ({previa}, cuenta {cuenta_previa}) queda intacta "
-            f"pero sin ticket que la apunte. `factoria adoptar {t.slug} --cuenta "
-            f"{cuenta_previa}` la vuelve a encontrar: nombra el slug.[/]")
+        console.print(f"  [dim]la anterior ({previa}, cuenta {cuenta_previa}) queda "
+                      f"asociada al ticket: deja de ser la responsable, pero sigue "
+                      f"anotada y se puede volver a ella con `factoria adoptar "
+                      f"{t.slug} {previa}`.[/]")
     if imprimir:
         _lanzar_en(cuenta, e.cwd, args, forzar, True, nota)
         console.print("  [dim]--imprimir: el ticket quedo intacto.[/]")
         return
-    e.session_id, e.cuenta = nuevo, cuenta
+    e.asociar(nuevo, cuenta)
     escribir_ticket(t)
     try:
         lanzo = _lanzar_en(cuenta, e.cwd, args, forzar, False, nota)
     except Exception:
-        e.session_id, e.cuenta = previa, cuenta_previa
-        escribir_ticket(t)
+        revertir()
         raise
     if not lanzo:
-        e.session_id, e.cuenta = previa, cuenta_previa
-        escribir_ticket(t)
-        console.print("  [dim]no se lanzo nada, asi que el ticket volvio a apuntar "
-                      f"a {previa or '(ninguna)'}.[/]")
+        revertir()
+        console.print(
+            f"  [dim]no se lanzo nada, asi que el ticket sigue apuntando a "
+            f"{previa or '(ninguna)'}. La receta de arriba abre la sesion con ese "
+            f"uuid: cuando este abierta, ahi adentro corre "
+            f"`factoria adoptar {t.slug} --aqui` y el ticket la toma.[/]")
 
 
 @cli.command()
@@ -1280,24 +1341,50 @@ def _arrancar_fresca(t: Ticket, e: RepoTicket, cuenta: str,
 @click.option("--dias", default=0, help="Solo sesiones de hace <= N dias. 0 = todas.")
 @click.option("--nueva", is_flag=True,
               help="No continuar: abrir una sesion NUEVA con el pack de contexto "
-                   "del ticket y registrarla. Con --cuenta, en esa cuenta.")
+                   "del ticket y registrarla como responsable.")
+@click.option("--fork", is_flag=True,
+              help="Ramificar la sesion actual: arranca con su contexto y la deja "
+                   "intacta. Para cuando pesa y vas a seguir trabajando.")
 @click.option("--imprimir", is_flag=True, help="Mostrar el comando sin ejecutarlo.")
 @click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
 def resume(consulta: str, repo: str | None, cuenta: str | None, elegir: int | None,
-           dias: int, nueva: bool, imprimir: bool, forzar: bool) -> None:
+           dias: int, nueva: bool, fork: bool, imprimir: bool, forzar: bool) -> None:
     """Reanuda la sesion de una tarea: continua la conversacion, no abre otra.
 
-    `--nueva` es el caso en que no hay conversacion que continuar: el ticket
-    vive en la otra cuenta (los transcripts son disjuntos), o la sesion se puso
-    cara. Abre una sesion nueva en la cuenta que se pida, le pasa el pack de
-    `contexto` como primer prompt y la deja registrada en el ticket.
+    Tres formas de seguir, por si la conversacion no sirve como esta:
+
+    \b
+      (sin flags)  continua la sesion responsable del ticket
+      --fork       ramifica: mismo contexto, .jsonl nuevo
+      --nueva      arranca limpia, con el pack de contexto del ticket
+
+    Las dos ultimas dejan de usar la sesion anterior, pero NO la borran del
+    ticket: queda asociada. Cambiar de cuenta es `factoria adoptar --cuenta`.
     """
+    if nueva and fork:
+        raise click.ClickException(
+            "--nueva y --fork son las dos maneras opuestas de cortar: --fork se "
+            "lleva el contexto, --nueva arranca sin el. Elegi una.")
     if nueva:
         tk = buscar_ticket(consulta)
-        _arrancar_fresca(tk, _entrada_unica(tk, repo), cuenta or _entrada_unica(
-            tk, repo).cuenta, imprimir, forzar)
+        e = _entrada_unica(tk, repo)
+        _arrancar_fresca(tk, e, cuenta or e.cuenta, imprimir, forzar)
         return
     d = resolver_destino(consulta, repo, cuenta, elegir, dias, "resume")
+    if fork:
+        if not d.existe:
+            raise click.ClickException(
+                f"la sesion {d.session_id} todavia no existe en disco: no hay de "
+                f"donde ramificar. Abrila primero con `factoria resume {consulta}`."
+            )
+        if _lanzar_en(d.cuenta, d.cwd, ["-r", d.session_id, "--fork-session"],
+                      forzar, imprimir, d.nota) and d.ticket:
+            # El fork estrena uuid y lo elige Claude, no nosotros: el ticket
+            # sigue apuntando a la sesion madre hasta que la hija se anote.
+            console.print(f"  [dim]el fork arranca con uuid propio: adentro corre "
+                          f"`factoria adoptar {d.ticket.slug} --aqui` para que el "
+                          f"ticket lo tome como responsable.[/]")
+        return
     if not d.existe:
         # Ticket recien creado con --no-lanzar: el id esta reservado pero el
         # .jsonl todavia no existe, asi que `-r` no lo encontraria.
@@ -1312,45 +1399,10 @@ def resume(consulta: str, repo: str | None, cuenta: str | None, elegir: int | No
             "compactacion vacia el prefijo, y el .jsonl solo acumula el registro.\n"
             f"[dim]Cortar se paga despues de ~{TURNOS_PARA_QUE_CONVENGA} turnos, o sea "
             "conviene si vas a seguir trabajando y no para una pregunta:\n"
-            f"  factoria cortar {consulta} --fork   (ramifica, conserva el contexto)\n"
+            f"  factoria resume {consulta} --fork   (ramifica, conserva el contexto)\n"
             f"  factoria resume {consulta} --nueva  (limpia, con el pack del ticket)[/]\n"
         )
     _lanzar_en(d.cuenta, d.cwd, ["-r", d.session_id], forzar, imprimir, d.nota)
-
-
-@cli.command()
-@click.argument("consulta")
-@click.option("--fork", is_flag=True,
-              help="Ramificar desde la sesion actual, preservandola intacta.")
-@click.option("--repo", help="Cuando el ticket tiene sesiones en varios repos.")
-@click.option("--cuenta", type=click.Choice(list(CUENTAS)))
-@click.option("--elegir", type=int)
-@click.option("--imprimir", is_flag=True)
-@click.option("--forzar", is_flag=True)
-def cortar(consulta: str, fork: bool, repo: str | None, cuenta: str | None,
-           elegir: int | None, imprimir: bool, forzar: bool) -> None:
-    """Corta una sesion cara. Con --fork ramifica; sin el, arranca limpia."""
-    d = resolver_destino(consulta, repo, cuenta, elegir, 0, "cortar")
-    if fork:
-        if not d.existe:
-            raise click.ClickException(
-                f"la sesion {d.session_id} todavia no existe en disco: no hay de donde "
-                f"ramificar. Abrila primero con `factoria resume {consulta}`."
-            )
-        _lanzar_en(d.cuenta, d.cwd, ["-r", d.session_id, "--fork-session"],
-                   forzar, imprimir, d.nota)
-        return
-    if d.ticket and d.entrada:
-        _arrancar_fresca(d.ticket, d.entrada, d.cuenta, imprimir, forzar)
-        return
-    # Sin ticket detras no hay pack que armar ni donde registrar el uuid: el
-    # destino salio de la busqueda por texto sobre las sesiones.
-    console.print(
-        f"[yellow]Sesion nueva y limpia[/] en {d.cwd} ({d.cuenta}) | {d.nota}\n"
-        f"[dim]La anterior queda intacta. Sin ticket detras arranca solo con el "
-        "CLAUDE.md del repo: si querias el pack, corrilo por slug de ticket.[/]\n"
-    )
-    _lanzar_en(d.cuenta, d.cwd, [], forzar, imprimir, d.nota)
 
 
 # --------------------------------------------------------------------------
@@ -1365,14 +1417,83 @@ RE_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 RE_FRONT = re.compile(r"\A---\s*\n(.*?)\n---[ \t]*\n?", re.S)
 
 
+def hoy() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+@dataclass
+class SesionTicket:
+    """Una sesion asociada a un ticket. Se serializa en UNA linea.
+
+    Un dict por sesion serian cuatro lineas de YAML cada una y el ticket entero
+    tiene una cota de 120: el historial se comeria el presupuesto del contenido,
+    que es lo unico que se lee. Como string queda una linea, alineada y legible
+    sin herramienta.
+    """
+    id: str
+    cuenta: str
+    desde: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.id}  {self.cuenta:<8}  {self.desde or '?'}".rstrip()
+
+    @staticmethod
+    def leer(crudo) -> SesionTicket | None:
+        # Acepta dict por si alguna vez se escribio asi a mano: el ticket es un
+        # .md que se edita, y negarse a leerlo perderia el historial entero.
+        if isinstance(crudo, dict):
+            crudo = " ".join(str(crudo.get(k) or "")
+                             for k in ("id", "cuenta", "desde"))
+        partes = str(crudo or "").split()
+        if not partes:
+            return None
+        return SesionTicket(id=partes[0],
+                            cuenta=partes[1] if len(partes) > 1 else "",
+                            desde=partes[2] if len(partes) > 2 and
+                            partes[2] != "?" else "")
+
+
 @dataclass
 class RepoTicket:
     repo: str
     cuenta: str
     rama: str = ""
     cwd: str = ""
+    # `session_id` es LA RESPONSABLE: la que `resume` reanuda y a la que apunta
+    # todo el resto. `sesiones` son todas las que pasaron por el ticket, la
+    # responsable incluida. Una sola puede ser responsable; ninguna se pierde
+    # al cambiarla, que es lo que volvia a `adoptar` un comando de una sola via.
     session_id: str = ""
+    sesiones: list[SesionTicket] = field(default_factory=list)
     doc: str = ""
+
+    def asociar(self, sid: str, cuenta: str, responsable: bool = True) -> None:
+        """Suma la sesion al ticket. Con `responsable`, ademas le pasa la posta.
+
+        Idempotente por uuid: readoptar la misma sesion no duplica la entrada ni
+        le pisa la fecha en que aparecio.
+        """
+        if not sid:
+            return
+        ya = next((s for s in self.sesiones if s.id == sid), None)
+        if ya:
+            ya.cuenta = cuenta or ya.cuenta
+        else:
+            self.sesiones.append(SesionTicket(id=sid, cuenta=cuenta, desde=hoy()))
+        if responsable:
+            self.session_id = sid
+            if cuenta:
+                self.cuenta = cuenta
+
+    def otras(self) -> list[SesionTicket]:
+        """Las asociadas que no son la responsable, de la mas nueva a la mas vieja."""
+        return sorted((s for s in self.sesiones if s.id != self.session_id),
+                      key=lambda s: s.desde, reverse=True)
+
+    def a_dict(self) -> dict:
+        d = dict(vars(self))
+        d["sesiones"] = [str(s) for s in self.sesiones]
+        return d
 
 
 @dataclass
@@ -1401,10 +1522,13 @@ class Ticket:
             "issue": self.issue,
             "issue_url": self.issue_url,
             "proyecto_item": self.proyecto_item,
-            "repos": [dict(vars(e)) for e in self.repos],
+            "repos": [e.a_dict() for e in self.repos],
         }
+        # width alto a proposito: por defecto yaml dobla los escalares planos a
+        # los 80 y una linea de sesion (uuid + cuenta + fecha) o un cwd largo
+        # salen partidos en dos, que es ilegible y dispara la cota de lineas.
         y = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True,
-                           default_flow_style=False).rstrip()
+                           default_flow_style=False, width=200).rstrip()
         return f"---\n{y}\n---\n\n{self.cuerpo.lstrip()}"
 
     @property
@@ -1430,11 +1554,20 @@ def leer_ticket(p: Path) -> Ticket | None:
         RepoTicket(
             repo=str(e.get("repo", "")), cuenta=str(e.get("cuenta", "")),
             rama=str(e.get("rama") or ""), cwd=str(e.get("cwd") or ""),
-            session_id=str(e.get("session_id") or ""), doc=str(e.get("doc") or ""),
+            session_id=str(e.get("session_id") or ""),
+            sesiones=[x for c in (e.get("sesiones") or [])
+                      if (x := SesionTicket.leer(c))],
+            doc=str(e.get("doc") or ""),
         )
         for e in (fm.get("repos") or [])
         if isinstance(e, dict) and e.get("repo")
     ]
+    # Los tickets anteriores al historial solo tienen `session_id`. Sembrarlo al
+    # leer es lo que hace que la primera adopcion no arranque perdiendo la unica
+    # sesion que el ticket conocia.
+    for e in repos:
+        if e.session_id and not any(s.id == e.session_id for s in e.sesiones):
+            e.sesiones.insert(0, SesionTicket(id=e.session_id, cuenta=e.cuenta))
     return Ticket(
         slug=str(fm.get("slug") or p.stem),
         fase=str(fm.get("fase") or "plan"),
@@ -1871,7 +2004,8 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     t = Ticket(
         slug=slug, fase="plan", abierto=True, spec_congelado="",
         repos=[RepoTicket(repo=rp.name, cuenta=cta, rama=rama, cwd=str(rp),
-                          session_id=sid, doc=str(doc))],
+                          session_id=sid, doc=str(doc),
+                          sesiones=[SesionTicket(sid, cta, hoy())])],
         cuerpo=CUERPO_TICKET.format(slug=slug, pedido=pedido.strip()),
         path=destino,
     )
@@ -2000,7 +2134,7 @@ def skills_cmd(fase_arg: str | None) -> None:
 @click.argument("slug")
 @click.argument("nueva", type=click.Choice(FASES))
 def fase_cmd(slug: str, nueva: str) -> None:
-    """Cambia la fase de un ticket. NO corta la sesion: eso es `cortar`."""
+    """Cambia la fase de un ticket. NO corta la sesion: eso es `resume --fork`."""
     t = buscar_ticket(slug)
     previa = t.fase
     if previa == nueva:
@@ -2063,7 +2197,7 @@ def tickets(todos: bool, como_json: bool) -> None:
         click.echo(json.dumps(
             [{"slug": t.slug, "fase": t.fase, "abierto": t.abierto,
               "spec_congelado": t.spec_congelado, "lineas": t.lineas,
-              "repos": [dict(vars(e)) for e in t.repos]} for t in ts],
+              "repos": [e.a_dict() for e in t.repos]} for t in ts],
             indent=2, ensure_ascii=False))
         return
     if not ts:
@@ -2090,7 +2224,9 @@ def tickets(todos: bool, como_json: bool) -> None:
         for i, e in enumerate(t.repos):
             t_.add_row(t.slug if i == 0 else "", t.fase if i == 0 else "",
                        e.repo, e.cuenta, e.rama or "-",
-                       "si" if e.session_id else "[red]NO[/]",
+                       # El numero son las sesiones asociadas: una sola es la
+                       # responsable, el resto es por donde paso el ticket.
+                       str(len(e.sesiones)) if e.session_id else "[red]NO[/]",
                        (f"#{t.issue}" if t.issue else "[dim]-[/]") if i == 0 else "",
                        str(t.lineas) if i == 0 else "")
     console.print(t_)
@@ -2438,149 +2574,22 @@ def cotas_cmd(contratos: bool, tickets: bool, docs: bool) -> None:
         raise SystemExit(1)
 
 
-def _elegir_sesion(t: Ticket, e: RepoTicket, cta: str,
-                   restringida: bool) -> tuple[str, str, str]:
-    """Que sesion adoptar sin uuid. Devuelve (uuid, cuenta, motivo).
-
-    La cuenta sale de DONDE ESTA la sesion elegida, no del ticket: buscar en
-    las dos y despues dejar la cuenta vieja escrita deja el ticket apuntando
-    a un uuid que `resume` no encuentra, que es el bug que este comando
-    arregla.
-
-    El orden de la evidencia es la leccion de haber adoptado la sesion
-    equivocada: el mtime no es evidencia de nada. Que el slug aparezca en el
-    transcript si lo es, y es el unico criterio que decide solo. Sin esa
-    evidencia el comando se niega y lista, porque la mas reciente del mismo cwd
-    puede ser cualquier conversacion que haya pasado por ese repo.
-
-    Sin `--cuenta` mira las dos: cuando `new` reserva el uuid con la cuenta del
-    perfil y el trabajo pasa por la otra, la cuenta del ticket apunta al lado
-    equivocado, y buscar solo ahi garantiza elegir mal.
-    """
-    cuentas = (cta,) if restringida else tuple(CUENTAS)
-    objetivo = str(Path(e.cwd)).lower() if e.cwd else ""
-
-    def mismo_cwd(s: Sesion) -> bool:
-        return bool(objetivo and s.cwd) and str(Path(s.cwd)).lower() == objetivo
-
-    universo = [s for s in inventario_sesiones() if s.cuenta in cuentas]
-    # La sesion que corre el comando nombra el slug porque se acaba de tipear
-    # el comando: no puede ser evidencia de si misma. Para esa esta `--aqui`.
-    yo = (sesion_actual() or ("", ""))[0]
-    nombran = sesiones_que_nombran(t.slug)
-    marcadas = [s for s in universo if s.session_id in nombran and s.session_id != yo]
-    if marcadas:
-        elegida = max(marcadas, key=lambda s: (mismo_cwd(s), s.mtime))
-        extra = "" if len(marcadas) == 1 else f", la mas reciente de {len(marcadas)}"
-        return (elegida.session_id, elegida.cuenta,
-                f"el slug aparece en su transcript{extra}")
-    cerca = sorted((s for s in universo if mismo_cwd(s)), key=lambda s: -s.mtime)
-    listado = "".join(
-        f"\n    {s.session_id}  {s.cuenta:<8} {s.mb:5.1f} MB  {s.dias}d  "
-        f"{s.titulo[:44] or 'sin titulo'}" for s in cerca[:6])
-    donde = (f"  Sesiones con cwd {e.cwd}:{listado}" if cerca
-             else f"  Ninguna sesion tiene cwd {e.cwd}.")
-    raise click.ClickException(
-        f"ninguna sesion nombra '{t.slug}' en su transcript, asi que no hay con "
-        "que saber cual hizo el trabajo. Adoptar la mas reciente del mismo cwd "
-        "es lo que hacia antes, y elige conversaciones ajenas.\n"
-        + donde
-        + "\n  Pasa el uuid, o --aqui si el trabajo sigue en esta sesion.")
+def _cuenta_de(sid: str) -> str | None:
+    """En que cuenta vive ese .jsonl. Los dos arboles son disjuntos, asi que
+    encontrarlo la identifica; pedirla por flag era hacer adivinar al usuario
+    algo que esta en disco."""
+    return next((c for c in CUENTAS if jsonl_de(sid, c)), None)
 
 
-@cli.command("adoptar")
-@click.argument("slug")
-@click.argument("session_id", required=False)
-@click.option("--repo", help="Cuando el ticket tiene varios repos.")
-@click.option("--cuenta", type=click.Choice(list(CUENTAS)),
-              help="Restringir la busqueda a esta cuenta y repuntar el ticket a ella.")
-@click.option("--aqui", is_flag=True,
-              help="Adoptar la sesion desde la que se esta corriendo esto.")
-@click.option("--forzar", is_flag=True, help="Reemplazar un id que si existe en disco.")
-def adoptar_cmd(slug: str, session_id: str | None, repo: str | None,
-                cuenta: str | None, aqui: bool, forzar: bool) -> None:
-    """Registra en el ticket la sesion que hizo el trabajo de verdad.
-
-    `new` reserva el uuid ANTES de que la sesion exista. Si el trabajo termino
-    pasando por otra -- la que ya estaba abierta, un fork, una arrancada a mano
-    -- el ticket apunta a un id que no esta en disco y `resume` abre una sesion
-    nueva en vez de continuar: el modo de fallo exacto que factoria existe para
-    evitar.
-
-    Sin uuid la busca por evidencia: la sesion cuyo transcript nombra el slug.
-    Si ninguna lo nombra se niega y lista, en vez de adoptar la mas reciente del
-    mismo cwd, que puede ser -- y fue -- una conversacion ajena.
-
-    `--aqui` adopta la sesion desde la que se corre el comando, sin adivinar
-    nada. Es el caso "el ticket nacio en la otra cuenta y de aca en adelante se
-    trabaja en esta": los transcripts de `dfv` y `personal` son directorios
-    disjuntos (0 uuid en comun sobre 337), asi que la conversacion no se muda.
-    Lo que se muda es a que sesion y a que cuenta apunta el ticket; el trabajo
-    entra en la sesion nueva con `factoria contexto <slug>`.
-    """
-    t = buscar_ticket(slug)
-    e = _entrada_unica(t, repo)
-    cta = cuenta or e.cuenta
-    if aqui:
-        if session_id:
-            raise click.ClickException(
-                "--aqui y un uuid explicito son la misma decision dos veces: "
-                "pasa uno solo")
-        actual = sesion_actual()
-        if not actual:
-            raise click.ClickException(
-                "--aqui solo corre DENTRO de una sesion de Claude Code: no hay "
-                "CLAUDE_CODE_SESSION_ID en el entorno")
-        session_id, cta_aqui = actual
-        if cuenta and cuenta != cta_aqui:
-            raise click.ClickException(
-                f"esta sesion es de la cuenta {cta_aqui}, no {cuenta}: --aqui ya "
-                "define la cuenta, saca --cuenta")
-        cta = cta_aqui
-    if session_id:
-        nuevo = session_id
-        if not jsonl_de(nuevo, cta):
-            otra = next((c for c in CUENTAS if c != cta and jsonl_de(nuevo, c)), None)
-            raise click.ClickException(
-                f"no hay .jsonl de {nuevo} en la cuenta {cta}. "
-                + (f"Si esta en '{otra}': agrega --cuenta {otra}"
-                   if otra else "Adoptar un id inexistente reproduce el problema "
-                                "que este comando arregla"))
-    else:
-        nuevo, cta, motivo = _elegir_sesion(t, e, cta, restringida=bool(cuenta))
-        console.print(f"  [dim]{motivo}[/]")
-    previa, cuenta_previa = e.session_id, e.cuenta
-    if nuevo == previa and cta == cuenta_previa:
-        console.print(f"[dim]{t.slug}/{e.repo} ya apunta a {nuevo}.[/]")
-        return
-    # Aviso y no error: una sesion sirviendo a dos tickets es un desorden real
-    # (`resume` de los dos cae en la misma conversacion, `cortar` uno corta el
-    # otro) pero pasa legitimamente cuando un ticket nace desde la sesion de
-    # otro. Con error obligaria a --forzar de rutina, y --forzar tambien apaga
-    # el guard de abajo, que importa mas: bypassear uno no puede bypassear los dos.
-    ajenos = sorted({x.slug for x in tickets_todos() if x.slug != t.slug
-                     for r in x.repos if r.session_id == nuevo})
-    if ajenos:
-        console.print(f"  [yellow]ojo:[/] {nuevo} ya es la sesion de "
-                      f"{', '.join(ajenos)}")
-    # El guard mira la cuenta VIEJA, que es donde vive la sesion que se estaria
-    # dejando sin ticket. Mirar la nueva lo desactiva justo cuando se cambia de
-    # cuenta, que es cuando mas hace falta: ahi el .jsonl anterior nunca esta.
-    if previa and jsonl_de(previa, cuenta_previa) and not forzar:
-        raise click.ClickException(
-            f"{previa} existe en disco (cuenta {cuenta_previa}): reemplazarla la "
-            "deja sin ticket que la encuentre. Repeti con --forzar si es lo que queres")
-    if cta != cuenta_previa:
-        console.print(f"  [dim]cuenta {cuenta_previa} -> {cta}[/]")
-        e.cuenta = cta
-    e.session_id = nuevo
-    escribir_ticket(t)
-    # Cuando solo cambio la cuenta, el "A -> A" es ruido: el cambio ya
-    # se imprimio arriba.
-    console.print(f"[bold]{t.slug}/{e.repo}[/]  " + (
-        f"sesion {previa or '(ninguna)'} -> {nuevo}" if nuevo != previa
-        else "misma sesion, ahora en la cuenta que la tiene"))
-    if (j := jsonl_de(nuevo, cta)):
+def _mostrar_sesiones(t: Ticket, e: RepoTicket) -> None:
+    """Quien manda y quien mas quedo asociada. Es el output que faltaba: sin
+    esto, cambiar de responsable era un salto a ciegas."""
+    console.print(f"[bold]{t.slug}/{e.repo}[/]  responsable "
+                  f"{e.session_id or '(ninguna)'} [dim]({e.cuenta})[/]")
+    for s in e.otras():
+        console.print(f"  [dim]asociada    {s.id} ({s.cuenta or '?'}"
+                      + (f", desde {s.desde}" if s.desde else "") + ")[/]")
+    if (j := jsonl_de(e.session_id, e.cuenta)):
         tam = j.stat().st_size
         m = _meta_sesion(j, tam)
         mb = tam / 1_048_576
@@ -2589,8 +2598,6 @@ def adoptar_cmd(slug: str, session_id: str | None, repo: str | None,
         if m["cwd"] and e.cwd and str(Path(m["cwd"])).lower() != str(Path(e.cwd)).lower():
             # `resume` hace `cd <cwd>` antes de `-r`: apuntar a un directorio
             # donde la sesion nunca corrio la deja sin sus archivos abiertos.
-            # Que el cwd no sea el del repo del ticket es legitimo -- una sesion
-            # puede editar otro repo -- pero tiene que quedar registrado.
             console.print(f"  [dim]cwd {e.cwd} -> {m['cwd']} (donde corre la sesion)[/]")
             e.cwd = m["cwd"]
             escribir_ticket(t)
@@ -2599,13 +2606,110 @@ def adoptar_cmd(slug: str, session_id: str | None, repo: str | None,
             # decision, y `rama` es el comando que la aplica en git tambien.
             console.print(f"  [yellow]la sesion esta en '{m['rama']}' y el ticket "
                           f"dice '{e.rama}'[/]: factoria rama {t.slug} <la correcta>")
-        if mb > UMBRAL_SESION_MB:
-            console.print(f"  [dim]pasa {UMBRAL_SESION_MB} MB: factoria cortar "
-                          f"{t.slug} cuando quieras arrancar liviano.[/]")
+
+
+@cli.command("adoptar")
+@click.argument("slug")
+@click.argument("session_id", required=False)
+@click.option("--cuenta", type=click.Choice(list(CUENTAS)),
+              help="La cuenta que agarra el ticket: abre una sesion NUEVA ahi.")
+@click.option("--aqui", is_flag=True,
+              help="La sesion desde la que corres esto pasa a ser la responsable.")
+@click.option("--repo", help="Cuando el ticket tiene varios repos.")
+@click.option("--imprimir", is_flag=True, help="Mostrar el comando sin ejecutarlo.")
+@click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
+def adoptar_cmd(slug: str, session_id: str | None, cuenta: str | None,
+                aqui: bool, repo: str | None, imprimir: bool, forzar: bool) -> None:
+    """Pasa el ticket a otra cuenta, o a otra sesion: cambia la responsable.
+
+    Un ticket tiene UNA sesion responsable -- la que `resume` reanuda -- y todas
+    las que pasaron por el quedan asociadas. Adoptar mueve la posta; no borra a
+    la anterior, asi que siempre se puede volver.
+
+    \b
+      --cuenta X   la cuenta X agarra el ticket: abre una sesion NUEVA ahi,
+                   con el pack de contexto como primer prompt
+      --aqui       la sesion destino ya existe y estas adentro: tomala
+      <uuid>       una sesion concreta, por si no estas adentro de ella
+
+    Cambiar de cuenta es el caso principal: los transcripts de `dfv` y
+    `personal` son directorios disjuntos (0 uuid en comun sobre 337), asi que la
+    conversacion no se puede mudar. Lo que se muda es el ticket, y la sesion
+    nueva arranca leyendo el pack en vez de arrancar sin saber nada.
+    """
+    t = buscar_ticket(slug)
+    e = _entrada_unica(t, repo)
+    pedidos = [n for n, v in (("--cuenta", cuenta), ("--aqui", aqui),
+                              ("un uuid", session_id)) if v]
+    if len(pedidos) > 1:
+        raise click.ClickException(
+            f"{' y '.join(pedidos)} son la misma decision dos veces: pasa uno solo.")
+
+    if not pedidos:
+        otra = next((c for c in CUENTAS if c != e.cuenta), "personal")
+        recetas = [(f"--cuenta {otra}", f"abre una sesion nueva en {otra}"),
+                   ("--aqui", "la toma esta sesion")]
+        ancho = max(len(m) for m, _ in recetas)
+        raise click.ClickException(
+            f"falta decir QUIEN adopta '{t.slug}'. Hoy la responsable es "
+            f"{e.session_id or '(ninguna)'} en la cuenta {e.cuenta}.\n"
+            + "".join(f"  factoria adoptar {t.slug} {m:<{ancho}}   {q}\n"
+                      for m, q in recetas)
+            + "Una sesion nueva en la MISMA cuenta no es adoptar: "
+            f"factoria resume {t.slug} --nueva")
+
+    if cuenta:
+        if cuenta == e.cuenta:
+            console.print(f"[dim]{t.slug}/{e.repo} ya esta en {cuenta}: adoptar igual "
+                          "abre una sesion nueva ahi, con el pack.[/]")
+        _arrancar_fresca(t, e, cuenta, imprimir, forzar)
+        return
 
     if aqui:
-        console.print(f"  [dim]el trabajo del ticket todavia no esta en el "
-                      f"contexto de esta sesion: factoria contexto {t.slug}[/]")
+        actual = sesion_actual()
+        if not actual:
+            raise click.ClickException(
+                "--aqui solo corre DENTRO de una sesion de Claude Code: no hay "
+                "CLAUDE_CODE_SESSION_ID en el entorno. Desde una terminal, pasa "
+                "el uuid, o --cuenta para abrir una sesion nueva.")
+        nuevo, cta = actual
+    else:
+        nuevo = session_id or ""
+        cta = _cuenta_de(nuevo) or ""
+        if not cta:
+            raise click.ClickException(
+                f"no hay .jsonl de {nuevo} en ninguna de las dos cuentas. Adoptar un "
+                "id inexistente reproduce el problema que este comando arregla: si "
+                f"la sesion todavia no existe, `factoria adoptar {t.slug} --cuenta "
+                "<cuenta>` la abre.")
+
+    if nuevo == e.session_id and cta == e.cuenta:
+        console.print(f"[dim]{t.slug}/{e.repo} ya apunta a {nuevo}.[/]")
+        _mostrar_sesiones(t, e)
+        return
+    # Aviso y no error: una sesion sirviendo a dos tickets es un desorden real
+    # (`resume` de los dos cae en la misma conversacion) pero pasa legitimamente
+    # cuando un ticket nace desde la sesion de otro.
+    ajenos = sorted({x.slug for x in tickets_todos() if x.slug != t.slug
+                     for r in x.repos if r.session_id == nuevo})
+    if ajenos:
+        console.print(f"  [yellow]ojo:[/] {nuevo} ya es la responsable de "
+                      f"{', '.join(ajenos)}")
+    previa = e.session_id
+    e.asociar(nuevo, cta)
+    escribir_ticket(t)
+    if previa:
+        console.print(f"  [dim]{previa} deja de ser responsable y queda asociada: "
+                      f"`factoria adoptar {t.slug} {previa}` la devuelve.[/]")
+    _mostrar_sesiones(t, e)
+    if aqui:
+        # El ticket ya apunta aca, pero esta sesion no sabe nada de el: sin el
+        # pack, adoptar deja el registro bien y el trabajo a ciegas.
+        CONTEXTOS.mkdir(parents=True, exist_ok=True)
+        pack = CONTEXTOS / f"{t.slug}.md"
+        pack.write_text(pack_de_contexto(t.slug), encoding="utf-8")
+        console.print(f"  [dim]el ticket todavia no esta en el contexto de esta "
+                      f"sesion: lee {pack}[/]")
 
 
 @cli.command("rama")
@@ -3413,7 +3517,8 @@ def open_cmd(slug: str, repo: str, cuenta: str | None, rama_pedida: str | None,
     sid = str(uuid.uuid4())
     doc = crear_doc(rp.name, t.slug)
     t.repos.append(RepoTicket(repo=rp.name, cuenta=cta, rama=rama, cwd=cwd,
-                              session_id=sid, doc=str(doc)))
+                              session_id=sid, doc=str(doc),
+                              sesiones=[SesionTicket(sid, cta, hoy())]))
     escribir_ticket(t)
     regenerar_indice()
     console.print(f"[bold]{t.slug}[/] + {rp.name} ({cta})  rama {rama}")

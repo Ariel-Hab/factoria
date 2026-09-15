@@ -1,7 +1,7 @@
 # factoria
 
 Gestor de tickets, sesiones y documentación para el ecosistema DFV. Un archivo
-Python, 23 comandos, sin servidor y sin base de datos.
+Python, 22 comandos, sin servidor y sin base de datos.
 
 ```mermaid
 flowchart LR
@@ -133,43 +133,73 @@ el historial no se pisa.
 
 ## Volver a una tarea
 
+Un ticket tiene **una sesión responsable** — la que `resume` reanuda — y guarda
+**todas las que pasaron por él**. Cambiar de responsable no borra a la anterior:
+queda asociada, y volver es el mismo comando con su uuid.
+
 ```mermaid
 flowchart LR
-    S(["quiero seguir<br/>con algo"]) --> Q{"¿el ticket apunta<br/>a la sesión real?"}
-    Q -->|sí| R["<b>resume</b> slug<br/><i>continúa la charla</i>"]
-    Q -->|"no: quedó el<br/>uuid reservado"| AD["<b>adoptar</b> slug"]
-    AD --> R
+    S(["quiero seguir<br/>con algo"]) --> Q{"¿desde dónde?"}
+    Q -->|"la cuenta<br/>que lo tiene"| R["<b>resume</b> slug<br/><i>continúa la charla</i>"]
+    Q -->|"la otra cuenta"| AD["<b>adoptar</b> slug<br/><b>--cuenta</b> X"]
+    AD --> NU["sesión nueva allá,<br/>arranca leyendo el pack"]
     R --> W{"¿pesa más<br/>de 1 MB?"}
     W -->|no| GO(["seguir"])
-    W -->|sí| CU["<b>cortar --fork</b><br/>o <b>resume --nueva</b>"]
+    W -->|sí| CU["<b>resume --fork</b><br/>o <b>resume --nueva</b>"]
     CU --> GO
+    NU --> GO
     style R fill:#238636,color:#fff
+    style AD fill:#8250df,color:#fff
     style CU fill:#bf8700,color:#fff
 ```
 
 ```bash
-factoria resume <slug>              # sin argumentos, lista lo que hay en vuelo
-factoria resume <slug> --nueva      # sesión NUEVA con el pack, registrada en el ticket
-factoria adoptar <slug>             # registra la sesión que hizo el trabajo de verdad
-factoria cortar <slug> --fork       # ramifica cuando pesa, preservando la anterior
-factoria contexto <slug>            # el pack mínimo: ticket + doc de trabajo + vecinos
+factoria resume <slug>                 # continúa la sesión responsable
+factoria resume <slug> --fork          # ramifica cuando pesa: mismo contexto, .jsonl nuevo
+factoria resume <slug> --nueva         # limpia, con el pack, en la misma cuenta
+factoria adoptar <slug> --cuenta dfv   # que lo agarre la otra cuenta
+factoria adoptar <slug> --aqui         # que lo agarre esta sesión, que ya está abierta
+factoria sesiones --ticket <slug>      # por dónde pasó el ticket
+factoria contexto <slug>               # el pack: ticket + doc de trabajo + vecinos
 ```
 
-### Cambiar de cuenta
+### Una responsable, ninguna perdida
+
+El ticket lleva el registro adentro, una línea por sesión:
+
+```yaml
+repos:
+- repo: defeve
+  cuenta: personal
+  session_id: 11111111-...        # la responsable: la que `resume` reanuda
+  sesiones:
+  - b7f7288f-...  dfv       2026-09-09
+  - 11111111-...  personal  2026-09-11
+```
+
+Eso es lo que arregla el modo de fallo que tenía `adoptar`: antes había **un solo
+slot**, así que cambiar de sesión responsable borraba la referencia a la anterior
+y no había cómo volver ni cómo saber por dónde había pasado el trabajo. Ahora
+`adoptar <slug> <uuid-viejo>` la devuelve, y las sesiones menores — una consulta
+al costado, un fix puntual — pueden quedar asociadas sin que ninguna le saque la
+posta a la que manda.
+
+### Cambiar de cuenta: para eso está `adoptar`
 
 **Las cuentas `dfv` y `personal` son transcripts disjuntos** (dos directorios
-distintos, 0 uuid en común sobre 337): una sesión **no se puede reanudar desde
-la otra cuenta**. Pero el trabajo sí se muda, y es un solo comando:
+distintos, 0 uuid en común sobre 337): una sesión **no se puede reanudar desde la
+otra cuenta**. Lo que se muda no es la conversación, es el ticket.
 
 ```bash
-factoria resume <slug> --nueva --cuenta dfv
+factoria adoptar <slug> --cuenta dfv
 ```
 
 ```mermaid
 flowchart LR
-    T["ticket<br/><i>cuenta: personal</i>"] --> N["<b>resume slug --nueva<br/>--cuenta dfv</b>"]
+    T["ticket<br/><i>cuenta: personal</i>"] --> N["<b>adoptar slug<br/>--cuenta dfv</b>"]
     N --> S["sesión nueva en dfv<br/><i>arranca leyendo el pack</i>"]
-    N --> R["el ticket queda<br/>apuntando a ésta"]
+    N --> R["responsable: la nueva"]
+    N --> A["la de personal<br/>queda asociada"]
     T -.->|"la conversación<br/>NO se muda"| X(("✗"))
     style N fill:#238636,color:#fff
     style S fill:#1f6feb,color:#fff
@@ -177,31 +207,29 @@ flowchart LR
 ```
 
 Hace las tres cosas juntas: abre la sesión en la cuenta que le pidas, le pasa el
-pack de `contexto` como **primer prompt**, y la deja **registrada en el ticket**
-— así el `resume` siguiente ya cae ahí. La anterior queda intacta, y `adoptar`
-la vuelve a encontrar cuando la necesites.
+pack de `contexto` como **primer prompt**, y le da la responsabilidad del ticket
+— así el `resume` siguiente ya cae ahí.
 
-Si al final no se lanza nada — por ejemplo porque estás adentro de otra sesión —
-**el registro se revierte**. Un uuid escrito que nadie va a abrir es justo el
-fantasma que `adoptar` viene a arreglar.
+Si al final no se lanza nada — por ejemplo porque estás adentro de otra sesión y
+no querés anidar — **el registro se revierte** y te deja la receta para pegar en
+otra terminal. Cuando esa sesión abra, `factoria adoptar <slug> --aqui` adentro
+la anota. Un uuid escrito que nadie va a abrir sigue siendo un fantasma.
 
 | Quiero… | Comando |
 |---|---|
-| **seguir el ticket en la otra cuenta** | `resume <slug> --nueva --cuenta dfv` |
-| la sesión que ya existe, en su cuenta | `resume <slug> --repo R` |
-| cortar porque se puso cara | `cortar <slug>` (limpia, con pack) o `--fork` (ramifica) |
-| arreglar "el ticket apunta a un uuid fantasma" | `adoptar <slug>` |
-| registrar la sesión en la que ya estoy sentado | `adoptar <slug> --aqui` |
+| **que el ticket lo siga la otra cuenta** | `adoptar <slug> --cuenta dfv` |
+| **que lo siga esta sesión, que ya está abierta** | `adoptar <slug> --aqui` |
+| volver a la sesión de antes | `adoptar <slug> <uuid>` |
+| seguir donde estaba | `resume <slug>` |
+| cortar porque se puso cara | `resume <slug> --fork` (ramifica) o `--nueva` (limpia, con pack) |
+| ver por dónde pasó el ticket | `sesiones --ticket <slug>` |
 | una entrada nueva para un 2º repo | `open <slug> --repo R2 --cuenta personal` |
 
-`adoptar` **sin uuid busca por evidencia**: la sesión cuyo transcript nombra el
-slug, en las dos cuentas, y le repunta también la cuenta. Si ninguna lo nombra
-se niega y lista las candidatas, en vez de tomar "la más reciente con el mismo
-`cwd`" — ese `cwd` lo comparten 6 sesiones de temas distintos, así que esa
-heurística elige conversaciones ajenas.
-
-La diferencia entre los dos: **`--nueva` abre la sesión**, `--aqui` registra una
-que ya está abierta y en la que estás trabajando.
+`adoptar` **no adivina**: sin `--cuenta`, sin `--aqui` y sin uuid te dice las dos
+recetas y para. La versión anterior elegía sola barriendo los transcripts, y
+elegir mal ahí significaba pisar el único puntero que existía. Esa búsqueda sigue
+disponible como **pregunta** en `sesiones --ticket <slug>`, que es de solo
+lectura y marca cuál es la responsable.
 
 ## El tablero de GitHub
 
@@ -317,8 +345,9 @@ porque nombran repos y rutas internas.
 |---|---|---|
 | `commit` no commitea y no dice nada | la rama está en `ramas_prohibidas` del perfil | ahora avisa; si el repo trabaja en `main` legítimamente, poner `ramas_prohibidas: []` |
 | `check` no verifica casi nada | ese perfil no declara `verify:` | agregarlo, o es un linter de cotas y no un DoD |
-| `resume` abre una sesión vacía | el ticket apunta a un uuid reservado que nunca se abrió | `factoria adoptar <slug>` |
-| `adoptar` registró una sesión que no tiene nada que ver | elegía la más reciente del mismo `cwd`, y ese `cwd` lo comparten 6 | ya elige por evidencia; `--aqui` para la sesión actual |
+| `resume` abre una sesión vacía | el ticket apunta a un uuid reservado que nunca se abrió | `factoria adoptar <slug> --aqui` desde la sesión real, o `sesiones --ticket <slug>` para encontrarla |
+| cambié de sesión responsable y perdí la anterior | había un solo slot: `adoptar` la pisaba | ya no pasa; quedan todas asociadas, y `adoptar <slug> <uuid>` vuelve a cualquiera |
+| `adoptar` pide que diga quién | cambiar de responsable no tiene default razonable | `--cuenta X` abre una sesión nueva allá; `--aqui` toma la actual |
 | el ticket no aparece en el tablero | el espejo quedó pendiente (sin red, sin `gh`) | `factoria espejo --todos` |
 | un `cd C:\ruta` en bash no llega | bash se come los `\` | `git -C C:/ruta`, o barras normales |
 

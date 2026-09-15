@@ -131,19 +131,17 @@ def test_entrada_por_nombre_de_repo_es_exacta():
         fx._entrada_unica(t, "factoria", exacto=True)
 
 
-def test_adoptar_no_huerfana_al_cambiar_de_cuenta():
-    """El guard de `adoptar` mira la cuenta VIEJA, no la nueva.
-
-    Los transcripts de dfv y personal son directorios disjuntos, asi que al
-    cambiar de cuenta el .jsonl previo nunca esta en la nueva: mirar ahi
-    desactiva el guard justo cuando mas hace falta.
+def test_adoptar_ya_no_necesita_guard_de_huerfanas():
+    """El guard viejo exigia --forzar para reemplazar una sesion que existiera en
+    disco, o sea en el caso normal, y eso era lo que volvia inusable al comando.
+    Con el historial no hay nada que proteger: la anterior queda asociada.
     """
     fuente = FUENTE.read_text(encoding="utf-8")
     i = fuente.index("def adoptar_cmd")
-    j = fuente.index("@cli.command", i)
-    cuerpo = fuente[i:j]
-    assert "jsonl_de(previa, cuenta_previa)" in cuerpo
-    assert "jsonl_de(previa, cta)" not in cuerpo
+    cuerpo = fuente[i:fuente.index("@cli.command", i)]
+    assert "jsonl_de(previa" not in cuerpo
+    assert "deja sin ticket que la encuentre" not in cuerpo
+    assert "e.asociar(" in cuerpo, "la responsable se mueve con asociar()"
 
 
 def _pasos(rama, base, trabajo_es_worktree=False, pusheada=False, repo="defeve"):
@@ -188,7 +186,7 @@ def test_close_sin_worktree_no_menciona_worktree():
 
 
 # --------------------------------------------------------------------------
-# adoptar: elegir la sesion por evidencia, no por mtime
+# adoptar: una sola sesion responsable, y ninguna se pierde
 # --------------------------------------------------------------------------
 
 # Con barras normales a proposito: Path lo normaliza a backslash en los dos
@@ -201,54 +199,134 @@ def _ses(sid, cuenta, mtime, cwd=CWD, titulo="x"):
                      dias=0, cwd=cwd, mtime=mtime, titulo=titulo)
 
 
-def _elegir(monkeypatch, sesiones, nombran, yo="", cuenta_ticket="dfv",
-            restringida=False):
-    monkeypatch.setattr(fx, "inventario_sesiones", lambda: sesiones)
-    monkeypatch.setattr(fx, "sesiones_que_nombran", lambda _a: set(nombran))
-    monkeypatch.setattr(fx, "sesion_actual", lambda: (yo, "dfv") if yo else None)
-    t = fx.Ticket(slug="mi-slug")
-    e = fx.RepoTicket(repo="defeve", cuenta=cuenta_ticket, cwd=CWD)
-    return fx._elegir_sesion(t, e, cuenta_ticket, restringida=restringida)
+def _ticket_con(sid="vieja", cuenta="dfv"):
+    e = fx.RepoTicket(repo="defeve", cuenta=cuenta, rama="feature/x", cwd=CWD,
+                      session_id=sid,
+                      sesiones=[fx.SesionTicket(sid, cuenta, "2026-09-01")])
+    return fx.Ticket(slug="mi-slug", repos=[e]), e
 
 
-def test_adoptar_elige_por_evidencia_y_no_por_mtime(monkeypatch):
-    """El bug real: adoptaba la mas reciente del mismo cwd, que era una
-    conversacion ajena que solo habia pasado por ese repo."""
-    ss = [_ses("la-del-ticket", "dfv", 100), _ses("ajena-reciente", "dfv", 999)]
-    sid, cta, motivo = _elegir(monkeypatch, ss, {"la-del-ticket"})
-    assert (sid, cta) == ("la-del-ticket", "dfv")
-    assert "transcript" in motivo
+def _adoptar(monkeypatch, tmp_path, args, t, aqui=("nueva", "personal"),
+             cuenta_de="personal"):
+    monkeypatch.setattr(fx, "buscar_ticket", lambda _s: t)
+    monkeypatch.setattr(fx, "tickets_todos", lambda: [t])
+    monkeypatch.setattr(fx, "escribir_ticket", lambda _t: None)
+    monkeypatch.setattr(fx, "sesion_actual", lambda: aqui)
+    monkeypatch.setattr(fx, "jsonl_de", lambda sid, cta: None)
+    monkeypatch.setattr(fx, "_cuenta_de", lambda sid: cuenta_de if sid else None)
+    monkeypatch.setattr(fx, "CONTEXTOS", tmp_path / "contexto")
+    monkeypatch.setattr(fx, "pack_de_contexto", lambda _s, *a, **k: "# pack")
+    return CliRunner().invoke(fx.cli, ["adoptar", *args])
 
 
-def test_adoptar_repunta_la_cuenta_a_la_que_tiene_la_sesion(monkeypatch):
-    """Buscar en las dos cuentas y dejar escrita la vieja deja el ticket
-    apuntando a un uuid que `resume` no encuentra: el bug que arregla."""
-    ss = [_ses("alla", "personal", 100), _ses("aca-ajena", "dfv", 999)]
-    sid, cta, _ = _elegir(monkeypatch, ss, {"alla"}, cuenta_ticket="dfv")
-    assert (sid, cta) == ("alla", "personal")
+def test_adoptar_aqui_no_pierde_la_sesion_anterior(monkeypatch, tmp_path):
+    """El bug que motivo todo esto: cambiar de responsable borraba la referencia
+    a la anterior, y no habia forma de volver ni de saber por donde paso."""
+    t, e = _ticket_con()
+    r = _adoptar(monkeypatch, tmp_path, ["mi-slug", "--aqui"], t)
+    assert r.exit_code == 0, r.output
+    assert (e.session_id, e.cuenta) == ("nueva", "personal")
+    assert [s.id for s in e.sesiones] == ["vieja", "nueva"]
+    assert [s.id for s in e.otras()] == ["vieja"]      # una sola responsable
+    assert "vieja" in r.output                         # y se ve, no queda oculta
 
 
-def test_adoptar_se_niega_si_ninguna_sesion_nombra_el_slug(monkeypatch):
-    """Sin evidencia no adivina: lista y pide el uuid o --aqui."""
-    ss = [_ses("ajena", "dfv", 999, titulo="otra cosa")]
-    with pytest.raises(fx.click.ClickException) as exc:
-        _elegir(monkeypatch, ss, set())
-    assert "--aqui" in exc.value.message
-    assert "ajena" in exc.value.message      # la lista, para poder elegir
+def test_adoptar_sin_decir_quien_no_adivina(monkeypatch, tmp_path):
+    """Sin modo no hay default razonable: adoptar cambia quien manda."""
+    t, _ = _ticket_con()
+    r = _adoptar(monkeypatch, tmp_path, ["mi-slug"], t)
+    assert r.exit_code != 0
+    assert "--cuenta personal" in r.output     # la otra cuenta, ya tipeada
+    assert "--aqui" in r.output
+    assert "resume mi-slug --nueva" in r.output  # el caso que NO es adoptar
 
 
-def test_adoptar_no_se_adopta_a_si_misma(monkeypatch):
-    """Correr `adoptar <slug>` deja el slug en el transcript de la sesion que lo
-    corre, asi que seria evidencia de si misma. Para esa esta --aqui."""
-    ss = [_ses("yo", "dfv", 999)]
-    with pytest.raises(fx.click.ClickException):
-        _elegir(monkeypatch, ss, {"yo"}, yo="yo")
+def test_adoptar_cuenta_abre_una_sesion_nueva_alla(monkeypatch, tmp_path):
+    """--cuenta es el caso principal: la otra cuenta agarra el ticket, y como
+    los transcripts son disjuntos eso solo puede ser una sesion nueva."""
+    t, e = _ticket_con()
+    vistas = []
+    monkeypatch.setattr(fx, "_arrancar_fresca",
+                        lambda tk, ent, cta, imp, frz: vistas.append(cta))
+    r = _adoptar(monkeypatch, tmp_path, ["mi-slug", "--cuenta", "personal"], t)
+    assert r.exit_code == 0, r.output
+    assert vistas == ["personal"]
 
 
-def test_adoptar_con_cuenta_explicita_no_mira_la_otra(monkeypatch):
-    ss = [_ses("alla", "personal", 999)]
-    with pytest.raises(fx.click.ClickException):
-        _elegir(monkeypatch, ss, {"alla"}, cuenta_ticket="dfv", restringida=True)
+def test_adoptar_rechaza_un_uuid_que_no_existe(monkeypatch, tmp_path):
+    """Adoptar un id que no esta en disco reproduce el fantasma que el comando
+    viene a arreglar: `resume` abre una sesion vacia."""
+    t, _ = _ticket_con()
+    r = _adoptar(monkeypatch, tmp_path, ["mi-slug", "no-existe"], t, cuenta_de=None)
+    assert r.exit_code != 0
+    assert "--cuenta" in r.output      # la salida: abrirla en vez de fingirla
+
+
+def test_adoptar_no_acepta_dos_modos_juntos(monkeypatch, tmp_path):
+    t, _ = _ticket_con()
+    r = _adoptar(monkeypatch, tmp_path, ["mi-slug", "--aqui", "--cuenta", "dfv"], t)
+    assert r.exit_code != 0
+    assert "uno solo" in r.output
+
+
+def test_readoptar_la_misma_sesion_no_duplica_ni_repisa_la_fecha():
+    _, e = _ticket_con()
+    e.asociar("vieja", "dfv")
+    assert len(e.sesiones) == 1
+    assert e.sesiones[0].desde == "2026-09-01"
+
+
+def test_volver_a_la_anterior_es_adoptarla_de_nuevo():
+    """Que la vuelta sea el mismo comando es todo el punto: antes la referencia
+    no estaba en ningun lado."""
+    _, e = _ticket_con()
+    e.asociar("nueva", "personal")
+    e.asociar("vieja", "dfv")
+    assert (e.session_id, e.cuenta) == ("vieja", "dfv")
+    assert [s.id for s in e.sesiones] == ["vieja", "nueva"]
+    assert len(e.sesiones) == 2      # ni duplicados ni perdidas
+
+
+def test_una_sesion_menor_no_le_saca_la_posta_a_la_responsable():
+    """Sesiones menores asociadas al ticket sin que manden: el `responsable=False`
+    existe para eso."""
+    _, e = _ticket_con()
+    e.asociar("menor", "dfv", responsable=False)
+    assert e.session_id == "vieja"
+    assert [s.id for s in e.otras()] == ["menor"]
+
+
+def test_el_historial_sobrevive_al_ida_y_vuelta_del_yaml(tmp_path):
+    t, e = _ticket_con()
+    e.asociar("nueva", "personal")
+    t.path = tmp_path / "mi-slug.md"
+    t.cuerpo = "## Pedido crudo\nalgo\n"
+    fx.escribir_ticket(t)
+    leido = fx.leer_ticket(t.path)
+    e2 = leido.repos[0]
+    assert e2.session_id == "nueva" and e2.cuenta == "personal"
+    assert [(s.id, s.cuenta) for s in e2.sesiones] == [
+        ("vieja", "dfv"), ("nueva", "personal")]
+    # una linea por sesion: el ticket tiene una cota de 120 y el historial no
+    # puede comerse el presupuesto del contenido
+    assert "\n  - vieja " in t.texto() or "\n    - vieja " in t.texto()
+
+
+def test_un_ticket_viejo_estrena_historial_con_la_sesion_que_tenia(tmp_path):
+    """Los tickets anteriores a esto solo tienen `session_id`. Si al leerlos no
+    se sembrara, la primera adopcion perderia la unica sesion conocida."""
+    p = tmp_path / "viejo.md"
+    p.write_text("---\nslug: viejo\nrepos:\n- repo: defeve\n  cuenta: dfv\n"
+                 "  session_id: la-unica\n---\n\ncuerpo\n", encoding="utf-8")
+    e = fx.leer_ticket(p).repos[0]
+    assert [(s.id, s.cuenta) for s in e.sesiones] == [("la-unica", "dfv")]
+
+
+def test_una_sesion_mal_escrita_a_mano_no_tumba_el_ticket():
+    """El ticket es un .md que se edita: negarse a leerlo perderia el historial."""
+    assert fx.SesionTicket.leer("") is None
+    assert fx.SesionTicket.leer("solo-el-uuid") == fx.SesionTicket("solo-el-uuid", "")
+    assert fx.SesionTicket.leer({"id": "u", "cuenta": "dfv"}).cuenta == "dfv"
 
 
 def test_sesion_actual_sale_del_entorno(monkeypatch):
@@ -273,13 +351,13 @@ def test_sesiones_que_nombran_encuentra_el_slug_partido_por_el_corte(
 
 
 def test_adoptar_avisa_pero_no_falla_si_la_sesion_es_de_otro_ticket():
-    """Aviso y no error: --forzar tambien apaga el guard de huerfanas, asi que
-    obligar a --forzar de rutina bypassearia el que importa mas."""
+    """Aviso y no error: un ticket que nace desde la sesion de otro es
+    legitimo, y convertirlo en error obligaria a un flag de rutina."""
     fuente = FUENTE.read_text(encoding="utf-8")
     i = fuente.index("def adoptar_cmd")
     cuerpo = fuente[i:fuente.index("@cli.command", i)]
     j = cuerpo.index("ajenos = ")
-    assert "raise" not in cuerpo[j:cuerpo.index("previa, cuenta_previa", j)]
+    assert "raise" not in cuerpo[j:cuerpo.index("e.asociar(", j)]
     # y el no-op tiene que resolverse ANTES del aviso
     assert cuerpo.index("ya apunta a") < j
 
@@ -343,11 +421,12 @@ def test_el_pack_de_contexto_es_reutilizable_como_funcion():
     assert "pack_de_contexto" in inspect.getsource(fx.contexto_cmd.callback)
 
 
-def test_resume_sin_nueva_apunta_a_nueva_cuando_la_cuenta_no_tiene_sesion():
-    """El error tiene que llevar a algun lado: era un callejon sin salida."""
+def test_resume_en_la_cuenta_que_no_tiene_sesion_apunta_a_adoptar():
+    """El error tiene que llevar a algun lado: era un callejon sin salida. Y el
+    lugar al que lleva es `adoptar`, que es el comando de cambiar de cuenta."""
     fuente = FUENTE.read_text(encoding="utf-8")
     i = fuente.index("no tiene entrada para esos filtros")
-    assert "--nueva --cuenta" in fuente[i:i + 700]
+    assert "factoria adoptar {t.slug} --cuenta {cuenta}" in fuente[i:i + 700]
 
 
 def test_un_ticket_cerrado_no_reporta_spec_drift():
