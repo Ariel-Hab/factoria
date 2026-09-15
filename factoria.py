@@ -58,7 +58,15 @@ COTA_DOC_TRABAJO = 200
 # Por FICHA, no sobre la suma de la carpeta: una referencia partida en 30
 # fichas no cuesta tokens si el indice deja abrir solo la que hace falta.
 # Lo que se paga es la ficha que se abre, asi que ahi va el techo.
-COTA_REFERENCIA = 120
+#
+# Arranco en 120, estimado sobre las 8 fichas de ingesta-demandsync (34 a 88).
+# Subio a 180 con evidencia: al partir las dos referencias grandes, 27 de 28
+# fichas quedaron abajo de 120, y la que no es `01-escritura-payload.md` con
+# 174 -- un unico bloque JSON con el comentario de cada campo adentro, que no
+# se puede partir sin inventar unidades. Un spec de payload pesa eso. El techo
+# acompania al dato en vez de forzar un corte artificial; sigue lejos de las
+# 250 del contrato, que es lo que separa "una ficha" de "el documento entero".
+COTA_REFERENCIA = 180
 # Umbral inicial para recomendar cortar sesion. Se calibra midiendo (plan §7.5).
 UMBRAL_SESION_MB = 1.0
 # Calibrado el 2026-09-10 con los 50.401 turnos con `usage` de las 342 sesiones
