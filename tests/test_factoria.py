@@ -131,6 +131,20 @@ def test_entrada_por_nombre_de_repo_es_exacta():
         fx._entrada_unica(t, "factoria", exacto=True)
 
 
+def test_el_repo_prefijo_se_puede_elegir_cuando_conviven():
+    """Con `factoria` y `.factoria` en el MISMO ticket, el de codigo era
+    inseleccionable: su nombre es prefijo del otro, el substring matcheaba las
+    dos y `adoptar`/`resume` fallaban siempre con "tiene 2 repos". No habia
+    texto que lo eligiera.
+    """
+    t = fx.Ticket(slug="x", repos=[
+        fx.RepoTicket(repo="factoria", cuenta="personal"),
+        fx.RepoTicket(repo=".factoria", cuenta="dfv"),
+    ])
+    assert fx._entrada_unica(t, "factoria").repo == "factoria"
+    assert fx._entrada_unica(t, ".factoria").repo == ".factoria"
+
+
 def test_adoptar_ya_no_necesita_guard_de_huerfanas():
     """El guard viejo exigia --forzar para reemplazar una sesion que existiera en
     disco, o sea en el caso normal, y eso era lo que volvia inusable al comando.

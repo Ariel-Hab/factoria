@@ -1260,7 +1260,8 @@ def resolver_destino(consulta: str, repo: str | None, cuenta: str | None,
     if t:
         entradas = t.repos
         if repo:
-            entradas = [e for e in entradas if repo.lower() in e.repo.lower()]
+            entradas = _desempatar_por_nombre_exacto(
+                [e for e in entradas if repo.lower() in e.repo.lower()], repo)
         if cuenta:
             entradas = [e for e in entradas if e.cuenta == cuenta]
         if not entradas:
@@ -2510,6 +2511,22 @@ def abrir_cmd(slug: str) -> None:
         console.print(f"[dim]no pude abrir el navegador ({exc}); la URL esta arriba.[/]")
 
 
+def _desempatar_por_nombre_exacto(entradas: list, repo: str | None) -> list:
+    """Si lo tipeado es EXACTAMENTE uno de los candidatos, gana ese.
+
+    Con `factoria` y `.factoria` en el mismo ticket el substring matchea las
+    dos, y el repo de codigo quedaba INSELECCIONABLE: su nombre es prefijo del
+    otro, asi que no existia texto que lo eligiera -- `--repo factoria` fallaba
+    siempre con "tiene 2 repos". Sin empate, el substring sigue siendo la
+    comodidad de antes: `--repo factoria` encuentra `.factoria` cuando es la
+    unica entrada.
+    """
+    if len(entradas) <= 1 or not repo:
+        return entradas
+    exactas = [e for e in entradas if e.repo.lower() == repo.lower()]
+    return exactas if len(exactas) == 1 else entradas
+
+
 def _entrada_unica(t: Ticket, repo: str | None, exacto: bool = False) -> RepoTicket:
     """La entrada del ticket para un repo.
 
@@ -2523,6 +2540,8 @@ def _entrada_unica(t: Ticket, repo: str | None, exacto: bool = False) -> RepoTic
             return True
         return e.repo.lower() == repo.lower() if exacto else repo.lower() in e.repo.lower()
     entradas = [e for e in t.repos if coincide(e)]
+    if not exacto:
+        entradas = _desempatar_por_nombre_exacto(entradas, repo)
     if not entradas:
         raise click.ClickException(
             f"'{t.slug}' no tiene entrada para --repo {repo}. Repos: "
