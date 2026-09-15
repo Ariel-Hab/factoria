@@ -2620,6 +2620,130 @@ def cotas_cmd(contratos: bool, tickets: bool, docs: bool, referencia: bool) -> N
         raise SystemExit(1)
 
 
+# Separadores que cierran un path escrito en prosa markdown. Partir por estos y
+# mirar el prefijo es mas robusto que una clase de caracteres en un regex: los
+# paths de Windows traen `\` y armar la clase bien es justo lo que sale mal.
+SEPS_PATH = " \t\n`()[]\"'<>|*,;"
+
+# `skills` y `agents` NO se migran nunca: sus .md se cargan desde la sesion de
+# CUALQUIER repo -- son skills y agentes a nivel usuario -- y ahi un link
+# relativo al vault no apunta a ningun lado. Son justo los archivos donde
+# `C:\ariel\dfv\.contracts\` es la forma correcta, y la skill lo dice: "usar
+# siempre el path absoluto". Migrarlos romperia la regla que documentan.
+# `contexto` y `logs` son derivados y gitignored: migrarlos se pierde en la
+# proxima regeneracion, y el pack de contexto sale del ticket ya migrado.
+LINKS_FUERA_DEL_VAULT = ("skills", "agents", "contexto", "logs")
+
+
+def _destino_en_vault(ref: str) -> Path | None:
+    """El archivo real del vault al que apunta una referencia absoluta.
+
+    None si apunta afuera. Resuelve el symlink: `C:\\ariel\\dfv\\.contracts\\x.md`
+    y `C:\\ariel\\.factoria\\contratos\\x.md` son el mismo archivo. Compara en
+    minuscula porque en el corpus conviven `C:\\Ariel\\...` y `C:\\ariel\\...`:
+    en Windows abren lo mismo, pero como texto son dos nodos distintos.
+    """
+    crudo = ref.replace("/", "\\")
+    low = crudo.lower()
+    for base, real in ((str(CONTRATOS).lower(), DATOS / "contratos"),
+                       (str(DATOS).lower(), DATOS)):
+        if low.startswith(base):
+            resto = crudo[len(base):].strip("\\")
+            return (real / resto) if resto else None
+    return None
+
+
+def _cuerpo_sin_frontmatter(texto: str) -> tuple[str, str]:
+    """(frontmatter, cuerpo). El frontmatter NO se migra nunca.
+
+    `doc:` y `cwd:` son paths absolutos que lee el codigo, no prosa: si se los
+    convierte en link markdown, el ticket deja de encontrar su propio doc de
+    trabajo. Son datos que parecen texto, y es el unico lugar del archivo donde
+    un path absoluto es obligatorio.
+    """
+    m = RE_FRONT.match(texto)
+    return (texto[:m.end()], texto[m.end():]) if m else ("", texto)
+
+
+def links_del_vault() -> list[tuple[Path, str, str | None]]:
+    """(archivo, referencia absoluta, link que la reemplaza o None si no aplica).
+
+    Solo se traduce un .md que exista: una raiz de repo o una carpeta es una
+    ubicacion, no una nota, y un link a algo que no esta es peor que el path.
+    """
+    salida = []
+    for p in sorted(DATOS.rglob("*.md")):
+        partes = p.relative_to(DATOS).parts
+        if partes[0] in LINKS_FUERA_DEL_VAULT or ".obsidian" in partes:
+            continue
+        front, texto = _cuerpo_sin_frontmatter(
+            p.read_text(encoding="utf-8", errors="replace"))
+        # Un ticket aprobado tiene la huella de criterios + fuera de alcance
+        # congelada, y las referencias suelen vivir justo ahi, en la evidencia
+        # de un criterio. Reescribirlas cambia la huella y `board` lo reporta
+        # como spec-drift: una alarma falsa por un cambio de formato. Se dejan
+        # como estan a proposito.
+        if "spec_congelado: ''" not in front and "spec_congelado:" in front:
+            continue
+        troceado = texto
+        for sep in SEPS_PATH:
+            troceado = troceado.replace(sep, "\n")
+        vistas = set()
+        for tok in troceado.split("\n"):
+            ref = tok.strip().rstrip(".,;:")
+            if not ref.lower().replace("/", "\\").startswith(str(ARIEL).lower()):
+                continue
+            if ref in vistas:
+                continue
+            vistas.add(ref)
+            destino = _destino_en_vault(ref)
+            if destino is None or destino.suffix.lower() != ".md" or not destino.is_file():
+                continue
+            rel = os.path.relpath(destino, p.parent).replace("\\", "/")
+            salida.append((p, ref, f"[{destino.stem}]({rel})"))
+    return salida
+
+
+@cli.command("links")
+@click.option("--migrar", is_flag=True, help="Reescribir, en vez de solo listar.")
+def links_cmd(migrar: bool) -> None:
+    """Las referencias absolutas que deberian ser links del vault. Sale con 1.
+
+    Un path absoluto en backticks no es un link: es codigo. Obsidian no lo
+    sigue, no genera backlink y no aparece en el grafo -- y el agente igual lo
+    abre, asi que el costo de escribirlo bien es cero y el beneficio es que las
+    dos herramientas ven la misma red.
+    """
+    pendientes = links_del_vault()
+    if not pendientes:
+        console.print("[green]links ok[/]: no hay referencias absolutas traducibles.")
+        return
+    if not migrar:
+        console.print(f"[bold]links[/] {len(pendientes)} referencias traducibles:")
+        for p, ref, nuevo in pendientes:
+            console.print(f"  [dim]{p.relative_to(DATOS)}[/]")
+            # El `[texto]` del link markdown es markup para rich: sin escapar,
+            # imprime el destino y se come el nombre.
+            console.print(f"    [red]{ref}[/]  ->  [green]{nuevo.replace('[', r'\[')}[/]")
+        console.print("[dim]  `factoria links --migrar` las reescribe.[/]")
+        raise SystemExit(1)
+
+    tocados = 0
+    for p in {x[0] for x in pendientes}:
+        front, cuerpo = _cuerpo_sin_frontmatter(
+            p.read_text(encoding="utf-8", errors="replace"))
+        original = cuerpo
+        # De mas larga a mas corta: si un path es prefijo de otro, reemplazar
+        # primero el corto parte el largo al medio.
+        for _, ref, nuevo in sorted((x for x in pendientes if x[0] == p),
+                                    key=lambda x: -len(x[1])):
+            cuerpo = cuerpo.replace(f"`{ref}`", nuevo).replace(ref, nuevo)
+        if cuerpo != original:
+            p.write_text(front + cuerpo, encoding="utf-8", newline="\n")
+            tocados += 1
+    console.print(f"[green]migrados[/] {len(pendientes)} links en {tocados} archivos.")
+
+
 def _cuenta_de(sid: str) -> str | None:
     """En que cuenta vive ese .jsonl. Los dos arboles son disjuntos, asi que
     encontrarlo la identifica; pedirla por flag era hacer adivinar al usuario
@@ -2866,8 +2990,13 @@ def renombrar_cmd(slug: str, nuevo: str, con_rama: bool) -> None:
 # al contrato <tema>, no a una cosa nueva. Antes solo matcheaba el .md colgado
 # directo de .contracts\, asi que partir un contrato en carpeta -- que es lo
 # que el estandar pide -- lo sacaba del grafo en silencio.
+#
+# Los dos nombres del mismo directorio son a proposito: `.contracts\` es el
+# canon cross-repo (absoluto, sirve desde cualquier repo) y `contratos/` es el
+# nombre real adentro del vault, que es como queda un link relativo de Obsidian.
+# Un link `../contratos/tema.md` matchea porque se busca como subcadena.
 RE_REF_CONTRATO = re.compile(
-    r"\.contracts[\\/](?:(?:referencia|historial)[\\/])?"
+    r"(?:\.contracts|contratos)[\\/](?:(?:referencia|historial)[\\/])?"
     r"([a-z0-9][a-z0-9._-]*?)(?:[\\/][a-z0-9][a-z0-9._-]*?)?\.md", re.I)
 # Los contratos ya traen items cross-repo reales: `- [ ] **(defeve → Cotizaciones)**`
 RE_BLOQUEO = re.compile(r"\((\w[\w.-]*)\s*(?:->|→|=>)\s*(\w[\w.-]*)\)")

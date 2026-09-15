@@ -552,6 +552,12 @@ def test_el_issue_espeja_los_entregables():
     (r".contracts\referencia\ingesta\01-ventas.md", "ingesta"),
     (".contracts/referencia/ingesta/01-ventas.md", "ingesta"),
     (r".contracts\historial\ingesta.md", "ingesta"),
+    # La forma vault-relativa: `contratos/` es el nombre real del directorio
+    # adentro del vault, que es como queda un link de Obsidian.
+    ("contratos/ingesta.md", "ingesta"),
+    ("../contratos/ingesta.md", "ingesta"),
+    ("contratos/referencia/ingesta/01-ventas.md", "ingesta"),
+    ("../../contratos/historial/ingesta.md", "ingesta"),
 ])
 def test_referencia_partida_refiere_al_contrato_padre(cita, tema):
     r"""Partir un contrato en carpeta no puede sacarlo del grafo.
@@ -580,3 +586,73 @@ def test_cotas_referencia_mide_por_ficha_e_incluye_el_readme(tmp_path, monkeypat
         fx.cli, ["cotas", "--no-contratos", "--no-tickets", "--no-docs"])
     assert r.exit_code == 1, r.output
     assert "01-larga.md" in r.output
+
+
+@pytest.mark.parametrize("ref", [
+    r"C:\ariel\.factoria\contratos\tema.md",
+    r"C:\Ariel\.factoria\contratos\tema.md",      # el casing convive en el corpus
+    "C:/ariel/.factoria/contratos/tema.md",
+    r"C:\ariel\dfv\.contracts\tema.md",           # el symlink, mismo archivo
+])
+def test_destino_en_vault_normaliza_casing_y_symlink(ref):
+    """`C:\\Ariel\\...` y `C:\\ariel\\...` abren lo mismo en Windows pero como
+    texto son dos nodos distintos, y `.contracts\\` es un symlink a `contratos\\`.
+    Los cuatro tienen que caer en el mismo archivo."""
+    assert fx._destino_en_vault(ref) == fx.DATOS / "contratos" / "tema.md"
+
+
+def test_destino_fuera_del_vault_no_se_traduce():
+    """Una raiz de repo es una ubicacion, no una nota."""
+    assert fx._destino_en_vault(r"C:\ariel\dfv\defeve") is None
+    assert fx._destino_en_vault(r"C:\ariel\integhra\factoria\factoria.py") is None
+
+
+def test_el_frontmatter_no_se_migra_nunca():
+    """`doc:` y `cwd:` son paths que lee el codigo, no prosa.
+
+    Convertirlos en link markdown deja al ticket sin poder encontrar su propio
+    doc de trabajo. En la primera corrida real, 16 de 19 referencias detectadas
+    eran campos del frontmatter.
+    """
+    front = "---\nslug: x\ndoc: C:" + chr(92) + "ariel" + chr(92) + ".factoria" + chr(92) + "docs" + chr(92) + "x.md\n---\n"
+    cuerpo = "ver el doc.\n"
+    f, c = fx._cuerpo_sin_frontmatter(front + cuerpo)
+    assert f == front and c == cuerpo
+    assert "doc:" not in c
+
+
+def test_links_es_idempotente_y_sale_con_1_si_queda_algo(tmp_path, monkeypatch):
+    """Segunda corrida: nada que hacer, y el gate pasa."""
+    vault = tmp_path / "vault"
+    (vault / "contratos").mkdir(parents=True)
+    (vault / "tickets").mkdir()
+    (vault / "contratos" / "tema.md").write_text("# tema\n", encoding="utf-8")
+    t = vault / "tickets" / "t.md"
+    t.write_text(f"ver `{vault}" + chr(92) + "contratos" + chr(92)
+                 + "tema.md` ahi.\n", encoding="utf-8")
+    monkeypatch.setattr(fx, "ARIEL", tmp_path)
+    monkeypatch.setattr(fx, "DATOS", vault)
+    monkeypatch.setattr(fx, "CONTRATOS", vault / "contratos")
+
+    assert len(fx.links_del_vault()) == 1
+    assert CliRunner().invoke(fx.cli, ["links"]).exit_code == 1
+    assert CliRunner().invoke(fx.cli, ["links", "--migrar"]).exit_code == 0
+    assert "(../contratos/tema.md)" in t.read_text(encoding="utf-8")
+    assert fx.links_del_vault() == []
+    assert CliRunner().invoke(fx.cli, ["links"]).exit_code == 0
+
+
+def test_links_no_toca_skills_ni_agents(tmp_path, monkeypatch):
+    """Se cargan desde la sesion de cualquier repo: ahi un path relativo al
+    vault no apunta a ningun lado, y el absoluto es la forma correcta."""
+    vault = tmp_path / "vault"
+    (vault / "contratos").mkdir(parents=True)
+    (vault / "skills" / "handoff").mkdir(parents=True)
+    (vault / "contratos" / "tema.md").write_text("# tema\n", encoding="utf-8")
+    ref = f"{vault}" + chr(92) + "contratos" + chr(92) + "tema.md"
+    (vault / "skills" / "handoff" / "SKILL.md").write_text(
+        "usar siempre " + ref + "\n", encoding="utf-8")
+    monkeypatch.setattr(fx, "ARIEL", tmp_path)
+    monkeypatch.setattr(fx, "DATOS", vault)
+    monkeypatch.setattr(fx, "CONTRATOS", vault / "contratos")
+    assert fx.links_del_vault() == []
