@@ -55,6 +55,10 @@ CUENTAS = {
 COTA_ESTADO_ACTUAL = 40
 COTA_CONTRATO = 250
 COTA_DOC_TRABAJO = 200
+# Por FICHA, no sobre la suma de la carpeta: una referencia partida en 30
+# fichas no cuesta tokens si el indice deja abrir solo la que hace falta.
+# Lo que se paga es la ficha que se abre, asi que ahi va el techo.
+COTA_REFERENCIA = 120
 # Umbral inicial para recomendar cortar sesion. Se calibra midiendo (plan §7.5).
 UMBRAL_SESION_MB = 1.0
 # Calibrado el 2026-09-10 con los 50.401 turnos con `usage` de las 342 sesiones
@@ -539,6 +543,26 @@ def cotas_contratos() -> list[tuple[str, int]]:
         n = len(p.read_text(encoding="utf-8", errors="replace").splitlines())
         out.append((p.name, n))
     return sorted(out, key=lambda t: -t[1])
+
+
+def cotas_referencia() -> list[tuple[str, int]]:
+    """Cada ficha de `referencia/` por separado, recursivo.
+
+    Era el unico directorio del estandar sin techo, y el que mas crecio: cuando
+    se midio, `lector-vademecum-defeve.md` tenia 1054 lineas y
+    `defeve-cotizador.md` 772. El README de una carpeta partida cuenta como
+    una ficha mas: un indice largo vuelve a ser el documento entero, que es
+    justo lo que partir la carpeta venia a evitar.
+    """
+    raiz = CONTRATOS / "referencia"
+    if not raiz.is_dir():
+        return []
+    medidos = [
+        (str(p.relative_to(raiz)),
+         len(p.read_text(encoding="utf-8", errors="replace").splitlines()))
+        for p in sorted(raiz.rglob("*.md"))
+    ]
+    return sorted(medidos, key=lambda t: -t[1])
 
 
 # --------------------------------------------------------------------------
@@ -2536,7 +2560,8 @@ def _renombrar_rama(rp: Path, vieja: str, nueva: str) -> None:
 @click.option("--contratos/--no-contratos", default=True)
 @click.option("--tickets/--no-tickets", default=True)
 @click.option("--docs/--no-docs", default=True)
-def cotas_cmd(contratos: bool, tickets: bool, docs: bool) -> None:
+@click.option("--referencia/--no-referencia", default=True)
+def cotas_cmd(contratos: bool, tickets: bool, docs: bool, referencia: bool) -> None:
     """Mide las cotas del estandar y sale con 1 si alguna se paso.
 
     La regla 2 del estandar pide guardian EXTERNO, y hasta ahora el unico era
@@ -2561,6 +2586,8 @@ def cotas_cmd(contratos: bool, tickets: bool, docs: bool) -> None:
         ] if raiz.is_dir() else []
         grupos.append(("docs de trabajo", COTA_DOC_TRABAJO,
                        sorted(medidos, key=lambda x: -x[1])))
+    if referencia:
+        grupos.append(("referencia", COTA_REFERENCIA, cotas_referencia()))
 
     excedidos = 0
     for nombre, cota, medidos in grupos:
@@ -2815,7 +2842,14 @@ def renombrar_cmd(slug: str, nuevo: str, con_rama: bool) -> None:
 # de codigo" sigue en pie porque no hay embeddings de nada.
 # --------------------------------------------------------------------------
 
-RE_REF_CONTRATO = re.compile(r"\.contracts[\\/]([a-z0-9][a-z0-9._-]*?)\.md", re.I)
+# Resuelve SIEMPRE al tema padre, venga del contrato, de una ficha de
+# referencia o del historial: `referencia\<tema>\01-ventas.md` refiere
+# al contrato <tema>, no a una cosa nueva. Antes solo matcheaba el .md colgado
+# directo de .contracts\, asi que partir un contrato en carpeta -- que es lo
+# que el estandar pide -- lo sacaba del grafo en silencio.
+RE_REF_CONTRATO = re.compile(
+    r"\.contracts[\\/](?:(?:referencia|historial)[\\/])?"
+    r"([a-z0-9][a-z0-9._-]*?)(?:[\\/][a-z0-9][a-z0-9._-]*?)?\.md", re.I)
 # Los contratos ya traen items cross-repo reales: `- [ ] **(defeve → Cotizaciones)**`
 RE_BLOQUEO = re.compile(r"\((\w[\w.-]*)\s*(?:->|→|=>)\s*(\w[\w.-]*)\)")
 

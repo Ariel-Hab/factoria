@@ -529,3 +529,40 @@ def test_el_issue_espeja_los_entregables():
     t = fx.Ticket(slug="x", cuerpo=("## Entregables de código\n"
                                     "- **nuevo** servicio `AuthService`\n"))
     assert "AuthService" in fx.cuerpo_issue(t)
+
+
+@pytest.mark.parametrize("cita,tema", [
+    (r"C:\ariel\dfv\.contracts\ingesta.md", "ingesta"),
+    ("C:/ariel/dfv/.contracts/ingesta.md", "ingesta"),
+    (r".contracts\referencia\ingesta.md", "ingesta"),
+    (r".contracts\referencia\ingesta\01-ventas.md", "ingesta"),
+    (".contracts/referencia/ingesta/01-ventas.md", "ingesta"),
+    (r".contracts\historial\ingesta.md", "ingesta"),
+])
+def test_referencia_partida_refiere_al_contrato_padre(cita, tema):
+    r"""Partir un contrato en carpeta no puede sacarlo del grafo.
+
+    Antes solo matcheaba el .md colgado directo de .contracts\, asi que un doc
+    que citaba una ficha de `referencia\<tema>\` no generaba ninguna arista
+    `refiere`: aplicar el estandar penalizaba en silencio al que lo aplicaba.
+    """
+    assert fx.RE_REF_CONTRATO.findall(cita) == [tema]
+
+
+def test_cotas_referencia_mide_por_ficha_e_incluye_el_readme(tmp_path, monkeypatch):
+    """El techo es por ficha; el indice de la carpeta cuenta como una mas."""
+    carpeta = tmp_path / "referencia" / "tema"
+    carpeta.mkdir(parents=True)
+    (carpeta / "README.md").write_text("indice\n" * 10, encoding="utf-8")
+    (carpeta / "01-larga.md").write_text(
+        "linea\n" * (fx.COTA_REFERENCIA + 1), encoding="utf-8")
+    monkeypatch.setattr(fx, "CONTRATOS", tmp_path)
+
+    medidos = dict(fx.cotas_referencia())
+    assert medidos[str(Path("tema") / "README.md")] == 10
+    assert medidos[str(Path("tema") / "01-larga.md")] == fx.COTA_REFERENCIA + 1
+
+    r = CliRunner().invoke(
+        fx.cli, ["cotas", "--no-contratos", "--no-tickets", "--no-docs"])
+    assert r.exit_code == 1, r.output
+    assert "01-larga.md" in r.output
