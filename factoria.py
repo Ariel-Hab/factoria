@@ -55,6 +55,18 @@ CUENTAS = {
 COTA_ESTADO_ACTUAL = 40
 COTA_CONTRATO = 250
 COTA_DOC_TRABAJO = 200
+# Por FICHA, no sobre la suma de la carpeta: una referencia partida en 30
+# fichas no cuesta tokens si el indice deja abrir solo la que hace falta.
+# Lo que se paga es la ficha que se abre, asi que ahi va el techo.
+#
+# Arranco en 120, estimado sobre las 8 fichas de ingesta-demandsync (34 a 88).
+# Subio a 180 con evidencia: al partir las dos referencias grandes, 27 de 28
+# fichas quedaron abajo de 120, y la que no es `01-escritura-payload.md` con
+# 174 -- un unico bloque JSON con el comentario de cada campo adentro, que no
+# se puede partir sin inventar unidades. Un spec de payload pesa eso. El techo
+# acompania al dato en vez de forzar un corte artificial; sigue lejos de las
+# 250 del contrato, que es lo que separa "una ficha" de "el documento entero".
+COTA_REFERENCIA = 180
 # Umbral inicial para recomendar cortar sesion. Se calibra midiendo (plan §7.5).
 UMBRAL_SESION_MB = 1.0
 # Calibrado el 2026-09-10 con los 50.401 turnos con `usage` de las 342 sesiones
@@ -539,6 +551,26 @@ def cotas_contratos() -> list[tuple[str, int]]:
         n = len(p.read_text(encoding="utf-8", errors="replace").splitlines())
         out.append((p.name, n))
     return sorted(out, key=lambda t: -t[1])
+
+
+def cotas_referencia() -> list[tuple[str, int]]:
+    """Cada ficha de `referencia/` por separado, recursivo.
+
+    Era el unico directorio del estandar sin techo, y el que mas crecio: cuando
+    se midio, `lector-vademecum-defeve.md` tenia 1054 lineas y
+    `defeve-cotizador.md` 772. El README de una carpeta partida cuenta como
+    una ficha mas: un indice largo vuelve a ser el documento entero, que es
+    justo lo que partir la carpeta venia a evitar.
+    """
+    raiz = CONTRATOS / "referencia"
+    if not raiz.is_dir():
+        return []
+    medidos = [
+        (str(p.relative_to(raiz)),
+         len(p.read_text(encoding="utf-8", errors="replace").splitlines()))
+        for p in sorted(raiz.rglob("*.md"))
+    ]
+    return sorted(medidos, key=lambda t: -t[1])
 
 
 # --------------------------------------------------------------------------
@@ -1236,7 +1268,8 @@ def resolver_destino(consulta: str, repo: str | None, cuenta: str | None,
     if t:
         entradas = t.repos
         if repo:
-            entradas = [e for e in entradas if repo.lower() in e.repo.lower()]
+            entradas = _desempatar_por_nombre_exacto(
+                [e for e in entradas if repo.lower() in e.repo.lower()], repo)
         if cuenta:
             entradas = [e for e in entradas if e.cuenta == cuenta]
         if not entradas:
@@ -2486,6 +2519,22 @@ def abrir_cmd(slug: str) -> None:
         console.print(f"[dim]no pude abrir el navegador ({exc}); la URL esta arriba.[/]")
 
 
+def _desempatar_por_nombre_exacto(entradas: list, repo: str | None) -> list:
+    """Si lo tipeado es EXACTAMENTE uno de los candidatos, gana ese.
+
+    Con `factoria` y `.factoria` en el mismo ticket el substring matchea las
+    dos, y el repo de codigo quedaba INSELECCIONABLE: su nombre es prefijo del
+    otro, asi que no existia texto que lo eligiera -- `--repo factoria` fallaba
+    siempre con "tiene 2 repos". Sin empate, el substring sigue siendo la
+    comodidad de antes: `--repo factoria` encuentra `.factoria` cuando es la
+    unica entrada.
+    """
+    if len(entradas) <= 1 or not repo:
+        return entradas
+    exactas = [e for e in entradas if e.repo.lower() == repo.lower()]
+    return exactas if len(exactas) == 1 else entradas
+
+
 def _entrada_unica(t: Ticket, repo: str | None, exacto: bool = False) -> RepoTicket:
     """La entrada del ticket para un repo.
 
@@ -2499,6 +2548,8 @@ def _entrada_unica(t: Ticket, repo: str | None, exacto: bool = False) -> RepoTic
             return True
         return e.repo.lower() == repo.lower() if exacto else repo.lower() in e.repo.lower()
     entradas = [e for e in t.repos if coincide(e)]
+    if not exacto:
+        entradas = _desempatar_por_nombre_exacto(entradas, repo)
     if not entradas:
         raise click.ClickException(
             f"'{t.slug}' no tiene entrada para --repo {repo}. Repos: "
@@ -2536,7 +2587,8 @@ def _renombrar_rama(rp: Path, vieja: str, nueva: str) -> None:
 @click.option("--contratos/--no-contratos", default=True)
 @click.option("--tickets/--no-tickets", default=True)
 @click.option("--docs/--no-docs", default=True)
-def cotas_cmd(contratos: bool, tickets: bool, docs: bool) -> None:
+@click.option("--referencia/--no-referencia", default=True)
+def cotas_cmd(contratos: bool, tickets: bool, docs: bool, referencia: bool) -> None:
     """Mide las cotas del estandar y sale con 1 si alguna se paso.
 
     La regla 2 del estandar pide guardian EXTERNO, y hasta ahora el unico era
@@ -2561,6 +2613,8 @@ def cotas_cmd(contratos: bool, tickets: bool, docs: bool) -> None:
         ] if raiz.is_dir() else []
         grupos.append(("docs de trabajo", COTA_DOC_TRABAJO,
                        sorted(medidos, key=lambda x: -x[1])))
+    if referencia:
+        grupos.append(("referencia", COTA_REFERENCIA, cotas_referencia()))
 
     excedidos = 0
     for nombre, cota, medidos in grupos:
@@ -2572,6 +2626,130 @@ def cotas_cmd(contratos: bool, tickets: bool, docs: bool) -> None:
             console.print(f"  [red]{l:>5}[/]  {n}  [dim]({l / cota:.1f}x)[/]")
     if excedidos:
         raise SystemExit(1)
+
+
+# Separadores que cierran un path escrito en prosa markdown. Partir por estos y
+# mirar el prefijo es mas robusto que una clase de caracteres en un regex: los
+# paths de Windows traen `\` y armar la clase bien es justo lo que sale mal.
+SEPS_PATH = " \t\n`()[]\"'<>|*,;"
+
+# `skills` y `agents` NO se migran nunca: sus .md se cargan desde la sesion de
+# CUALQUIER repo -- son skills y agentes a nivel usuario -- y ahi un link
+# relativo al vault no apunta a ningun lado. Son justo los archivos donde
+# `C:\ariel\dfv\.contracts\` es la forma correcta, y la skill lo dice: "usar
+# siempre el path absoluto". Migrarlos romperia la regla que documentan.
+# `contexto` y `logs` son derivados y gitignored: migrarlos se pierde en la
+# proxima regeneracion, y el pack de contexto sale del ticket ya migrado.
+LINKS_FUERA_DEL_VAULT = ("skills", "agents", "contexto", "logs")
+
+
+def _destino_en_vault(ref: str) -> Path | None:
+    """El archivo real del vault al que apunta una referencia absoluta.
+
+    None si apunta afuera. Resuelve el symlink: `C:\\ariel\\dfv\\.contracts\\x.md`
+    y `C:\\ariel\\.factoria\\contratos\\x.md` son el mismo archivo. Compara en
+    minuscula porque en el corpus conviven `C:\\Ariel\\...` y `C:\\ariel\\...`:
+    en Windows abren lo mismo, pero como texto son dos nodos distintos.
+    """
+    crudo = ref.replace("/", "\\")
+    low = crudo.lower()
+    for base, real in ((str(CONTRATOS).lower(), DATOS / "contratos"),
+                       (str(DATOS).lower(), DATOS)):
+        if low.startswith(base):
+            resto = crudo[len(base):].strip("\\")
+            return (real / resto) if resto else None
+    return None
+
+
+def _cuerpo_sin_frontmatter(texto: str) -> tuple[str, str]:
+    """(frontmatter, cuerpo). El frontmatter NO se migra nunca.
+
+    `doc:` y `cwd:` son paths absolutos que lee el codigo, no prosa: si se los
+    convierte en link markdown, el ticket deja de encontrar su propio doc de
+    trabajo. Son datos que parecen texto, y es el unico lugar del archivo donde
+    un path absoluto es obligatorio.
+    """
+    m = RE_FRONT.match(texto)
+    return (texto[:m.end()], texto[m.end():]) if m else ("", texto)
+
+
+def links_del_vault() -> list[tuple[Path, str, str | None]]:
+    """(archivo, referencia absoluta, link que la reemplaza o None si no aplica).
+
+    Solo se traduce un .md que exista: una raiz de repo o una carpeta es una
+    ubicacion, no una nota, y un link a algo que no esta es peor que el path.
+    """
+    salida = []
+    for p in sorted(DATOS.rglob("*.md")):
+        partes = p.relative_to(DATOS).parts
+        if partes[0] in LINKS_FUERA_DEL_VAULT or ".obsidian" in partes:
+            continue
+        front, texto = _cuerpo_sin_frontmatter(
+            p.read_text(encoding="utf-8", errors="replace"))
+        # Un ticket aprobado tiene la huella de criterios + fuera de alcance
+        # congelada, y las referencias suelen vivir justo ahi, en la evidencia
+        # de un criterio. Reescribirlas cambia la huella y `board` lo reporta
+        # como spec-drift: una alarma falsa por un cambio de formato. Se dejan
+        # como estan a proposito.
+        if "spec_congelado: ''" not in front and "spec_congelado:" in front:
+            continue
+        troceado = texto
+        for sep in SEPS_PATH:
+            troceado = troceado.replace(sep, "\n")
+        vistas = set()
+        for tok in troceado.split("\n"):
+            ref = tok.strip().rstrip(".,;:")
+            if not ref.lower().replace("/", "\\").startswith(str(ARIEL).lower()):
+                continue
+            if ref in vistas:
+                continue
+            vistas.add(ref)
+            destino = _destino_en_vault(ref)
+            if destino is None or destino.suffix.lower() != ".md" or not destino.is_file():
+                continue
+            rel = os.path.relpath(destino, p.parent).replace("\\", "/")
+            salida.append((p, ref, f"[{destino.stem}]({rel})"))
+    return salida
+
+
+@cli.command("links")
+@click.option("--migrar", is_flag=True, help="Reescribir, en vez de solo listar.")
+def links_cmd(migrar: bool) -> None:
+    """Las referencias absolutas que deberian ser links del vault. Sale con 1.
+
+    Un path absoluto en backticks no es un link: es codigo. Obsidian no lo
+    sigue, no genera backlink y no aparece en el grafo -- y el agente igual lo
+    abre, asi que el costo de escribirlo bien es cero y el beneficio es que las
+    dos herramientas ven la misma red.
+    """
+    pendientes = links_del_vault()
+    if not pendientes:
+        console.print("[green]links ok[/]: no hay referencias absolutas traducibles.")
+        return
+    if not migrar:
+        console.print(f"[bold]links[/] {len(pendientes)} referencias traducibles:")
+        for p, ref, nuevo in pendientes:
+            console.print(f"  [dim]{p.relative_to(DATOS)}[/]")
+            # El `[texto]` del link markdown es markup para rich: sin escapar,
+            # imprime el destino y se come el nombre.
+            console.print(f"    [red]{ref}[/]  ->  [green]{nuevo.replace('[', r'\[')}[/]")
+        console.print("[dim]  `factoria links --migrar` las reescribe.[/]")
+        raise SystemExit(1)
+
+    tocados = 0
+    for p in {x[0] for x in pendientes}:
+        front, cuerpo = _cuerpo_sin_frontmatter(
+            p.read_text(encoding="utf-8", errors="replace"))
+        original = cuerpo
+        # De mas larga a mas corta: si un path es prefijo de otro, reemplazar
+        # primero el corto parte el largo al medio.
+        for _, ref, nuevo in sorted((x for x in pendientes if x[0] == p),
+                                    key=lambda x: -len(x[1])):
+            cuerpo = cuerpo.replace(f"`{ref}`", nuevo).replace(ref, nuevo)
+        if cuerpo != original:
+            p.write_text(front + cuerpo, encoding="utf-8", newline="\n")
+            tocados += 1
+    console.print(f"[green]migrados[/] {len(pendientes)} links en {tocados} archivos.")
 
 
 def _cuenta_de(sid: str) -> str | None:
@@ -2815,7 +2993,19 @@ def renombrar_cmd(slug: str, nuevo: str, con_rama: bool) -> None:
 # de codigo" sigue en pie porque no hay embeddings de nada.
 # --------------------------------------------------------------------------
 
-RE_REF_CONTRATO = re.compile(r"\.contracts[\\/]([a-z0-9][a-z0-9._-]*?)\.md", re.I)
+# Resuelve SIEMPRE al tema padre, venga del contrato, de una ficha de
+# referencia o del historial: `referencia\<tema>\01-ventas.md` refiere
+# al contrato <tema>, no a una cosa nueva. Antes solo matcheaba el .md colgado
+# directo de .contracts\, asi que partir un contrato en carpeta -- que es lo
+# que el estandar pide -- lo sacaba del grafo en silencio.
+#
+# Los dos nombres del mismo directorio son a proposito: `.contracts\` es el
+# canon cross-repo (absoluto, sirve desde cualquier repo) y `contratos/` es el
+# nombre real adentro del vault, que es como queda un link relativo de Obsidian.
+# Un link `../contratos/tema.md` matchea porque se busca como subcadena.
+RE_REF_CONTRATO = re.compile(
+    r"(?:\.contracts|contratos)[\\/](?:(?:referencia|historial)[\\/])?"
+    r"([a-z0-9][a-z0-9._-]*?)(?:[\\/][a-z0-9][a-z0-9._-]*?)?\.md", re.I)
 # Los contratos ya traen items cross-repo reales: `- [ ] **(defeve → Cotizaciones)**`
 RE_BLOQUEO = re.compile(r"\((\w[\w.-]*)\s*(?:->|→|=>)\s*(\w[\w.-]*)\)")
 
