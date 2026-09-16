@@ -893,13 +893,15 @@ def board(docs: bool, ramas: bool, sesiones: bool, limite: int, como_json: bool)
         t = Table(title="Tickets en vuelo", title_justify="left", header_style="bold")
         t.add_column("slug", overflow="fold")
         t.add_column("fase")
+        t.add_column("tipo")
         t.add_column("repos")
         t.add_column("ses")
         t.add_column("lin", justify="right")
-        for tk in sorted(abiertos, key=lambda x: (FASES.index(x.fase) if x.fase in FASES else 9,
-                                                  x.slug))[:limite]:
+        for tk in sorted(abiertos, key=lambda x: (
+                FASES.index(x.fase) if x.fase in FASES else 9,
+                _orden_tipo(x.tipo), x.slug))[:limite]:
             con_ses = sum(1 for e in tk.repos if e.session_id)
-            t.add_row(tk.slug, tk.fase,
+            t.add_row(tk.slug, tk.fase, tk.tipo,
                       ", ".join(f"{e.repo}({e.cuenta})" for e in tk.repos) or "[red]-[/]",
                       f"{con_ses}/{len(tk.repos)}", str(tk.lineas))
         console.print(t)
@@ -1533,6 +1535,10 @@ class RepoTicket:
 class Ticket:
     slug: str
     fase: str = "plan"
+    # `feature|fix|chore`, el mismo vocabulario que TIPOS_RAMA. Es orden para
+    # mirar (board agrupa feature antes que fix antes que chore), nunca un
+    # gate: nada se niega por ser chore.
+    tipo: str = "feature"
     abierto: bool = True
     spec_congelado: str = ""
     issue: int = 0
@@ -1550,6 +1556,7 @@ class Ticket:
         fm = {
             "slug": self.slug,
             "fase": self.fase,
+            "tipo": self.tipo,
             "abierto": self.abierto,
             "spec_congelado": self.spec_congelado,
             "issue": self.issue,
@@ -1571,6 +1578,20 @@ class Ticket:
     @property
     def lineas(self) -> int:
         return len(self.texto().splitlines())
+
+
+def _inferir_tipo(repos: list[RepoTicket]) -> str:
+    """Un ticket sin `tipo:` en el frontmatter lo hereda del prefijo de la
+    primera rama que lo diga, y cae en `feature` si ninguna dice nada.
+
+    Es la unica migracion de los tickets que ya existen: no se editan a mano,
+    y el prefijo de su rama es la mejor evidencia que hay en disco.
+    """
+    for e in repos:
+        prefijo = (e.rama or "").split("/", 1)[0]
+        if prefijo in TIPOS_RAMA:
+            return prefijo
+    return "feature"
 
 
 def leer_ticket(p: Path) -> Ticket | None:
@@ -1608,6 +1629,7 @@ def leer_ticket(p: Path) -> Ticket | None:
     return Ticket(
         slug=str(fm.get("slug") or p.stem),
         fase=str(fm.get("fase") or "plan"),
+        tipo=str(fm.get("tipo") or _inferir_tipo(repos)),
         abierto=bool(fm.get("abierto", True)),
         spec_congelado=str(fm.get("spec_congelado") or ""),
         issue=int(fm.get("issue") or 0),
@@ -1903,15 +1925,15 @@ def regenerar_indice() -> Path:
         "una sesion: para eso esta `factoria contexto <slug>`. Para mirarlo agrupado,",
         "[el mapa del vault](MAPA.md) y las vistas de `tickets.base`.",
         "",
-        "| slug | fase | repos | sesiones | issue |",
-        "|---|---|---|---|---|",
+        "| slug | fase | tipo | repos | sesiones | issue |",
+        "|---|---|---|---|---|---|",
     ]
     for t in sorted(ts, key=lambda x: (not x.abierto, x.slug)):
         repos = ", ".join(e.repo for e in t.repos) or "-"
         ses = sum(1 for e in t.repos if e.session_id)
         iss = f"[#{t.issue}]({t.issue_url})" if t.issue_url else "-"
         lineas.append(
-            f"| [{t.slug}](tickets/{t.slug}.md) | {t.fase} | {repos} | {ses} | {iss} |"
+            f"| [{t.slug}](tickets/{t.slug}.md) | {t.fase} | {t.tipo} | {repos} | {ses} | {iss} |"
         )
     lineas.append("")
     p = DATOS / "INDICE.md"
@@ -2093,11 +2115,12 @@ def regenerar_repos(ts: list[Ticket] | None = None) -> list[Path]:
              "estan `INDICE.md`, `tickets.base` y `factoria contexto <slug>`.", ""]
         if abiertos:
             L += ["## Tickets abiertos", ""]
-            L += [f"- [{t.slug}](../tickets/{t.slug}.md) — {t.fase}" for t in abiertos]
+            L += [f"- [{t.slug}](../tickets/{t.slug}.md) — {t.fase} · {t.tipo}"
+                  for t in abiertos]
             L += [""]
         if cerrados:
             L += ["## Tickets cerrados", ""]
-            L += [f"- [{t.slug}](../tickets/{t.slug}.md)" for t in cerrados]
+            L += [f"- [{t.slug}](../tickets/{t.slug}.md) — {t.tipo}" for t in cerrados]
             L += [""]
         if docs:
             L += ["## Docs de trabajo", ""]
@@ -2199,6 +2222,12 @@ def regenerar_temas(temas: dict[str, list[str]], citas: dict[str, set[str]]) -> 
 # feature/ (51 ramas) y fix/ (41) son tu convencion real en defeve; chore/ (7)
 # la sigue. El default es feature porque es el caso mayoritario.
 TIPOS_RAMA = ("feature", "fix", "chore")
+
+
+def _orden_tipo(tipo: str) -> int:
+    """Jerarquia de `board`: orden para mirar, nunca autoridad. Nada se niega
+    por ser chore; esto solo decide en que orden aparece."""
+    return TIPOS_RAMA.index(tipo) if tipo in TIPOS_RAMA else len(TIPOS_RAMA)
 
 
 def existe_rama(rp: Path, nombre: str) -> bool:
@@ -2311,7 +2340,7 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     rama = _resolver_rama(rp, base, actual, rama_pedida, slug, tipo, aqui)
     doc = crear_doc(rp.name, slug)
     t = Ticket(
-        slug=slug, fase="plan", abierto=True, spec_congelado="",
+        slug=slug, fase="plan", tipo=tipo, abierto=True, spec_congelado="",
         repos=[RepoTicket(repo=rp.name, cuenta=cta, rama=rama, cwd=str(rp),
                           session_id=sid, doc=str(doc),
                           sesiones=[SesionTicket(sid, cta, hoy())])],
@@ -2494,17 +2523,38 @@ def fase_cmd(slug: str, nueva: str) -> None:
             "raiz del repo.[/]")
 
 
+@cli.command("tipo")
+@click.argument("slug")
+@click.argument("nuevo", type=click.Choice(TIPOS_RAMA))
+def tipo_cmd(slug: str, nuevo: str) -> None:
+    """Recategoriza un ticket ya creado. No toca la rama: para eso está `rama`."""
+    t = buscar_ticket(slug)
+    previo = t.tipo
+    if previo == nuevo:
+        console.print(f"[dim]{t.slug} ya es {nuevo}.[/]")
+        return
+    t.tipo = nuevo
+    escribir_ticket(t)
+    regenerar_indice()
+    console.print(f"[bold]{t.slug}[/]  {previo} -> {nuevo}")
+    espejar_si_se_puede(t)
+
+
 @cli.command()
 @click.option("--todos", is_flag=True, help="Incluir los cerrados.")
+@click.option("--tipo", "tipo_filtro", type=click.Choice(TIPOS_RAMA),
+              help="Filtrar por tipo.")
 @click.option("--json", "como_json", is_flag=True, help="Volcado crudo.")
-def tickets(todos: bool, como_json: bool) -> None:
+def tickets(todos: bool, tipo_filtro: str | None, como_json: bool) -> None:
     """Lista los tickets con su fase, repos y sesiones asociadas."""
     ts = tickets_todos()
     if not todos:
         ts = [t for t in ts if t.abierto]
+    if tipo_filtro:
+        ts = [t for t in ts if t.tipo == tipo_filtro]
     if como_json:
         click.echo(json.dumps(
-            [{"slug": t.slug, "fase": t.fase, "abierto": t.abierto,
+            [{"slug": t.slug, "fase": t.fase, "tipo": t.tipo, "abierto": t.abierto,
               "spec_congelado": t.spec_congelado, "lineas": t.lineas,
               "repos": [e.a_dict() for e in t.repos]} for t in ts],
             indent=2, ensure_ascii=False))
@@ -2520,6 +2570,7 @@ def tickets(todos: bool, como_json: bool) -> None:
     t_ = Table(title_justify="left", header_style="bold")
     t_.add_column("slug", overflow="fold")
     t_.add_column("fase")
+    t_.add_column("tipo")
     t_.add_column("repo")
     t_.add_column("cuenta")
     t_.add_column("rama", max_width=26, overflow="fold")
@@ -2528,10 +2579,11 @@ def tickets(todos: bool, como_json: bool) -> None:
     t_.add_column("lin", justify="right")
     for t in ts:
         if not t.repos:
-            t_.add_row(t.slug, t.fase, "[red]-[/]", "-", "-", "-",
+            t_.add_row(t.slug, t.fase, t.tipo, "[red]-[/]", "-", "-", "-",
                        f"#{t.issue}" if t.issue else "-", str(t.lineas))
         for i, e in enumerate(t.repos):
             t_.add_row(t.slug if i == 0 else "", t.fase if i == 0 else "",
+                       t.tipo if i == 0 else "",
                        e.repo, e.cuenta, e.rama or "-",
                        # El numero son las sesiones asociadas: una sola es la
                        # responsable, el resto es por donde paso el ticket.
@@ -2600,6 +2652,7 @@ def cuerpo_issue(t: Ticket) -> str:
         f"no este issue: `.factoria/tickets/{t.slug}.md`.",
         "",
         f"**fase:** `{t.fase}`",
+        f"**tipo:** `{t.tipo}`",
         "",
         "**repos**",
         "",
@@ -2646,9 +2699,13 @@ def _labels_del_ticket(t: Ticket, cfg: dict) -> list[str]:
     """Los repos van como label y no como campo del Project: un ticket cruza
     repos por naturaleza y un single-select no puede tener N valores."""
     lb = cfg.get("labels") or {}
-    pr, pc = lb.get("prefijo_repo", "repo:"), lb.get("prefijo_cuenta", "cuenta:")
+    pr = lb.get("prefijo_repo", "repo:")
+    pc = lb.get("prefijo_cuenta", "cuenta:")
+    pt = lb.get("prefijo_tipo", "tipo:")
     nombres = {f"{pr}{e.repo}" for e in t.repos}
     nombres |= {f"{pc}{e.cuenta}" for e in t.repos if e.cuenta}
+    if t.tipo:
+        nombres.add(f"{pt}{t.tipo}")
     return sorted(nombres)
 
 
@@ -3944,13 +4001,14 @@ def aprobar_cmd(slug: str) -> None:
 @click.option("--repo", required=True, help="El segundo repo que suma el ticket.")
 @click.option("--cuenta", type=click.Choice(list(CUENTAS)))
 @click.option("--rama", "rama_pedida", help="Nombre completo de la rama.")
-@click.option("--tipo", type=click.Choice(TIPOS_RAMA), default="feature", show_default=True)
+@click.option("--tipo", type=click.Choice(TIPOS_RAMA),
+              help="Prefijo de la rama. Por defecto, el tipo del ticket.")
 @click.option("--worktree/--sin-worktree", default=None,
               help="Forzar o evitar el ritual de worktree del perfil.")
 @click.option("--no-lanzar", is_flag=True)
 @click.option("--forzar", is_flag=True)
 def open_cmd(slug: str, repo: str, cuenta: str | None, rama_pedida: str | None,
-             tipo: str, worktree: bool | None, no_lanzar: bool, forzar: bool) -> None:
+             tipo: str | None, worktree: bool | None, no_lanzar: bool, forzar: bool) -> None:
     """Suma un repo al ticket, con su propia sesion y cuenta. Exige spec aprobado."""
     t = buscar_ticket(slug)
     if not t.spec_congelado:
@@ -3959,6 +4017,7 @@ def open_cmd(slug: str, repo: str, cuenta: str | None, rama_pedida: str | None,
             "Cruzar a un segundo repo con el requerimiento sin cerrar es como se "
             f"multiplica una mala interpretacion. Corré `factoria aprobar {t.slug}`."
         )
+    tipo = tipo or t.tipo
     rp = ruta_repo(repo)
     if not rp:
         raise click.ClickException(f"no encuentro el repo '{repo}'.")

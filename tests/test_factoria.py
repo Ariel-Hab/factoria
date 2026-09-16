@@ -656,3 +656,133 @@ def test_links_no_toca_skills_ni_agents(tmp_path, monkeypatch):
     monkeypatch.setattr(fx, "DATOS", vault)
     monkeypatch.setattr(fx, "CONTRATOS", vault / "contratos")
     assert fx.links_del_vault() == []
+
+
+# --------------------------------------------------------------------------
+# tag-por-ticket: tipo (feature|fix|chore) por ticket
+# --------------------------------------------------------------------------
+
+def test_new_persiste_el_tipo(monkeypatch, tmp_path):
+    """`--tipo` no era mas que el prefijo de la rama: quedaba invisible en
+    cuanto la rama se renombraba o el ticket se miraba desde `tickets.base`."""
+    datos = tmp_path / "datos"
+    (datos / "tickets").mkdir(parents=True)
+    monkeypatch.setattr(fx, "DATOS", datos)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(fx, "ruta_repo", lambda _n: repo)
+    monkeypatch.setattr(fx, "perfil", lambda _n: {"cuenta": "dfv", "base": "main"})
+    monkeypatch.setattr(fx, "git", lambda *a, **k: "main")
+    monkeypatch.setattr(fx, "_resolver_rama", lambda *a, **k: "fix/x")
+    monkeypatch.setattr(fx, "regenerar_indice", lambda: None)
+
+    r = CliRunner().invoke(fx.cli, ["new", "x", "--repo", "repo", "--pedido", "algo",
+                                    "--tipo", "fix", "--no-lanzar"])
+    assert r.exit_code == 0, r.output
+    t = fx.leer_ticket(datos / "tickets" / "x.md")
+    assert t.tipo == "fix"
+
+
+def test_el_tipo_se_infiere_de_la_rama(tmp_path):
+    """Los tickets anteriores a este campo no tienen `tipo:`: se infiere del
+    prefijo de la primera rama que lo diga, y `feature` si ninguna lo dice."""
+    con_rama = tmp_path / "con-rama.md"
+    con_rama.write_text(
+        "---\nslug: con-rama\nrepos:\n- repo: defeve\n  cuenta: dfv\n"
+        "  rama: fix/algo\n---\n\ncuerpo\n", encoding="utf-8")
+    assert fx.leer_ticket(con_rama).tipo == "fix"
+
+    sin_prefijo = tmp_path / "sin-prefijo.md"
+    sin_prefijo.write_text(
+        "---\nslug: sin-prefijo\nrepos:\n- repo: defeve\n  cuenta: dfv\n"
+        "  rama: desarrollo-ari\n---\n\ncuerpo\n", encoding="utf-8")
+    assert fx.leer_ticket(sin_prefijo).tipo == "feature"
+
+    explicito = tmp_path / "explicito.md"
+    explicito.write_text(
+        "---\nslug: explicito\ntipo: chore\nrepos:\n- repo: defeve\n"
+        "  cuenta: dfv\n  rama: fix/algo\n---\n\ncuerpo\n", encoding="utf-8")
+    assert fx.leer_ticket(explicito).tipo == "chore"
+
+
+def test_tickets_filtra_por_tipo(monkeypatch):
+    ts = [
+        fx.Ticket(slug="aaa-feature", tipo="feature",
+                  repos=[fx.RepoTicket(repo="defeve", cuenta="dfv")]),
+        fx.Ticket(slug="bbb-fix", tipo="fix",
+                  repos=[fx.RepoTicket(repo="defeve", cuenta="dfv")]),
+    ]
+    monkeypatch.setattr(fx, "tickets_todos", lambda: ts)
+    r = CliRunner().invoke(fx.cli, ["tickets", "--tipo", "fix"])
+    assert r.exit_code == 0, r.output
+    assert "bbb-fix" in r.output
+    assert "aaa-feature" not in r.output
+
+    r_todos = CliRunner().invoke(fx.cli, ["tickets"])
+    assert "aaa-feature" in r_todos.output and "bbb-fix" in r_todos.output
+
+
+def test_tipo_cmd_cambia_y_persiste(monkeypatch):
+    t = fx.Ticket(slug="x", tipo="feature",
+                  repos=[fx.RepoTicket(repo="defeve", cuenta="dfv")])
+    monkeypatch.setattr(fx, "buscar_ticket", lambda _s: t)
+    escritos = []
+    monkeypatch.setattr(fx, "escribir_ticket", lambda tk: escritos.append(tk.tipo))
+    monkeypatch.setattr(fx, "regenerar_indice", lambda: None)
+    monkeypatch.setattr(fx, "espejar_si_se_puede", lambda tk: None)
+
+    r = CliRunner().invoke(fx.cli, ["tipo", "x", "chore"])
+    assert r.exit_code == 0, r.output
+    assert t.tipo == "chore"
+    assert escritos == ["chore"]
+
+    # sin cambio: no reescribe
+    r2 = CliRunner().invoke(fx.cli, ["tipo", "x", "chore"])
+    assert r2.exit_code == 0, r2.output
+    assert escritos == ["chore"]
+
+
+def test_el_issue_lleva_la_label_del_tipo():
+    t = fx.Ticket(slug="x", tipo="fix",
+                  repos=[fx.RepoTicket(repo="defeve", cuenta="dfv")])
+    assert "tipo:fix" in fx._labels_del_ticket(t, {})
+    # prefijo configurable en github.yml, igual que repo: y cuenta:
+    labels = fx._labels_del_ticket(t, {"labels": {"prefijo_tipo": "kind:"}})
+    assert "kind:fix" in labels and "tipo:fix" not in labels
+
+
+def test_board_ordena_por_jerarquia(monkeypatch):
+    """Dentro de la misma fase: feature antes que fix, fix antes que chore."""
+    ts = [
+        fx.Ticket(slug="c-chore", fase="dev", tipo="chore", abierto=True),
+        fx.Ticket(slug="a-feature", fase="dev", tipo="feature", abierto=True),
+        fx.Ticket(slug="b-fix", fase="dev", tipo="fix", abierto=True),
+    ]
+    monkeypatch.setattr(fx, "relevar", lambda: fx.Relevamiento(tickets=ts))
+    monkeypatch.setattr(fx, "regenerar_indice", lambda: None)
+
+    r = CliRunner().invoke(
+        fx.cli, ["board", "--no-docs", "--no-ramas", "--no-sesiones"])
+    assert r.exit_code == 0, r.output
+    i_feature = r.output.index("a-feature")
+    i_fix = r.output.index("b-fix")
+    i_chore = r.output.index("c-chore")
+    assert i_feature < i_fix < i_chore, r.output
+
+
+def test_el_indice_y_la_ficha_muestran_el_tipo(tmp_path, monkeypatch):
+    datos = tmp_path / "datos"
+    datos.mkdir()
+    monkeypatch.setattr(fx, "DATOS", datos)
+    monkeypatch.setattr(fx, "descubrir_repos", lambda: [])
+    t = fx.Ticket(slug="x", fase="dev", tipo="fix",
+                  repos=[fx.RepoTicket(repo="defeve", cuenta="dfv")])
+    monkeypatch.setattr(fx, "tickets_todos", lambda: [t])
+
+    fx.regenerar_indice()
+    indice = (datos / "INDICE.md").read_text(encoding="utf-8")
+    assert "| tipo |" in indice
+    assert "| fix |" in indice
+
+    ficha = (datos / "repos" / "defeve.md").read_text(encoding="utf-8")
+    assert "fix" in ficha
