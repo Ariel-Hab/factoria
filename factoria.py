@@ -1555,6 +1555,10 @@ class Ticket:
             "issue": self.issue,
             "issue_url": self.issue_url,
             "proyecto_item": self.proyecto_item,
+            # Derivada de `repos`, duplicada a proposito: Obsidian no agrupa ni
+            # busca por una lista de diccionarios. Esta es la que leen las vistas
+            # de `tickets.base` y las queries de color del grafo.
+            "repos_lista": [e.repo for e in self.repos],
             "repos": [e.a_dict() for e in self.repos],
         }
         # width alto a proposito: por defecto yaml dobla los escalares planos a
@@ -1896,7 +1900,8 @@ def regenerar_indice() -> Path:
         "# Indice de tickets",
         "",
         "Generado por `factoria board`. No se edita a mano, y no se carga al abrir",
-        "una sesion: para eso esta `factoria contexto <slug>`.",
+        "una sesion: para eso esta `factoria contexto <slug>`. Para mirarlo agrupado,",
+        "[el mapa del vault](MAPA.md) y las vistas de `tickets.base`.",
         "",
         "| slug | fase | repos | sesiones | issue |",
         "|---|---|---|---|---|",
@@ -1912,7 +1917,278 @@ def regenerar_indice() -> Path:
     p = DATOS / "INDICE.md"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("\n".join(lineas), encoding="utf-8", newline="\n")
+
+    # `repos_lista` es nueva y ningun comando reescribe un ticket que no toca,
+    # asi que los viejos no la tendrian nunca. Reescribir solo cuando el texto ya
+    # no coincide con lo que `texto()` genera los pone al dia y es idempotente:
+    # la huella del spec sale de las secciones del cuerpo, no del frontmatter.
+    for t in ts:
+        if t.path and t.path.is_file() and t.path.read_text(
+                encoding="utf-8", errors="replace") != t.texto():
+            escribir_ticket(t)
+
+    regenerar_repos(ts)
     return p
+
+
+# Lo que un agente o vos abren primero, y que no pertenece a ningun repo.
+# La etiqueta es propia y no sale del path a proposito: tres archivos se llaman
+# `SKILL.md` y dos `README.md`, y en el grafo se verian como el mismo nodo.
+CORE_DEL_VAULT = (
+    ("Indice de tickets", "INDICE.md", "todos los tickets, una linea cada uno"),
+    ("Tabla de tickets", "tickets.base", "las mismas filas, agrupadas y filtrables"),
+    ("Contratos", "contratos/README.md", "el canal cross-repo y sus reglas"),
+    ("Skill factoria", "skills/factoria/SKILL.md", "cuando corre cada comando"),
+    ("Skill handoff", "skills/handoff/SKILL.md", "como se escribe un contrato"),
+    ("Skill ship", "skills/ship/SKILL.md", "como se cierra"),
+)
+
+
+def _archivo_ficha(repo: str) -> str:
+    """El nombre de archivo de la ficha, que no siempre es el del repo.
+
+    Obsidian oculta todo lo que empieza con punto, asi que `.factoria.md` seria
+    invisible justo en la herramienta para la que la ficha existe. El punto pasa
+    a guion bajo solo en el nombre: adentro el repo se sigue llamando `.factoria`.
+    """
+    return (f"_{repo[1:]}" if repo.startswith(".") else repo) + ".md"
+
+
+def _plural(n: int, singular: str) -> str:
+    return f"{n} {singular}" + ("" if n == 1 else "s")
+
+
+def _docs_del_repo(repo: str) -> list[tuple[str, str]]:
+    """(titulo, path relativo al vault) de los docs de trabajo de un repo.
+
+    De las carpetas partidas entra solo el README: las 13 fichas de
+    `oferta-transfer-publicar-en-integhra` son el adentro del doc, no 13 docs.
+    """
+    d = DATOS / "docs" / repo
+    if not d.is_dir():
+        return []
+    salida = [(p.stem, f"docs/{repo}/{p.name}") for p in sorted(d.glob("*.md"))]
+    salida += [(sub.name, f"docs/{repo}/{sub.name}/README.md")
+               for sub in sorted(d.iterdir())
+               if sub.is_dir() and (sub / "README.md").is_file()]
+    return salida
+
+
+# Cuantas veces tiene que nombrar un contrato a un repo para contarlo como
+# participante. Medido sobre los 16 contratos: los repos que de verdad
+# participan aparecen entre 4 y 56 veces y los de paso entre 1 y 3, con el corte
+# limpio en 4. Es lo unico inferido de todo el vault -- el contrato no declara
+# sus repos en ningun lado -- y si algun dia `/handoff` los declara, esto se
+# reemplaza por leer esa linea.
+MENCIONES_PARA_REPO = 4
+
+
+def temas_de_contrato() -> list[str]:
+    d = DATOS / "contratos"
+    return sorted(p.stem for p in d.glob("*.md") if p.stem != "README") if d.is_dir() else []
+
+
+def _repos_del_tema(tema: str, conocidos: list[str]) -> list[str]:
+    """Los repos que nombra el archivo caliente del contrato.
+
+    El lookbehind deja afuera el nombre del propio tema: en
+    `carga-automatica-defeve` el `defeve` del titulo viene pegado a un guion y
+    no cuenta como mencion.
+    """
+    try:
+        texto = (DATOS / "contratos" / f"{tema}.md").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    salida = []
+    for r in conocidos:
+        pat = re.compile(rf"(?<![\w-]){re.escape(r)}(?![\w-])", re.I)
+        if len(pat.findall(texto)) >= MENCIONES_PARA_REPO:
+            salida.append(r)
+    return sorted(salida)
+
+
+def _partes_del_tema(tema: str) -> tuple[list[tuple[str, str]], str]:
+    """(fichas de referencia, historial) de un tema, como (etiqueta, path)."""
+    base = DATOS / "contratos"
+    refs: list[tuple[str, str]] = []
+    suelta = base / "referencia" / f"{tema}.md"
+    if suelta.is_file():
+        refs.append((tema, f"contratos/referencia/{tema}.md"))
+    carpeta = base / "referencia" / tema
+    if carpeta.is_dir():
+        refs += [(p.stem, f"contratos/referencia/{tema}/{p.name}")
+                 for p in sorted(carpeta.glob("*.md"))]
+    hist = f"contratos/historial/{tema}.md"
+    return refs, (hist if (base / "historial" / f"{tema}.md").is_file() else "")
+
+
+def _contratos_citados(t: Ticket) -> set[str]:
+    """Los contratos que cita el ticket, por el mismo criterio que el grafo."""
+    texto = t.cuerpo
+    for e in t.repos:
+        if e.doc and Path(e.doc).is_file():
+            texto += Path(e.doc).read_text(encoding="utf-8", errors="replace")
+    return {m.lower() for m in RE_REF_CONTRATO.findall(texto)}
+
+
+def regenerar_repos(ts: list[Ticket] | None = None) -> list[Path]:
+    """Una ficha por repo y un MAPA.md al centro. Existen para el grafo.
+
+    El grafo de Obsidian agrupa por LINKS, no por propiedades: sin una nota que
+    enlace los tickets de un repo, son puntos sueltos colgando de `INDICE.md`.
+    La ficha es esa nota y `MAPA.md` el centro que ata las fichas a los docs
+    core. No agregan informacion -- la reordenan -- y por eso se regeneran
+    enteras y no se editan a mano.
+    """
+    ts = tickets_todos() if ts is None else ts
+    d = DATOS / "repos"
+    d.mkdir(parents=True, exist_ok=True)
+
+    por_repo: dict[str, list[Ticket]] = {}
+    for t in ts:
+        for e in t.repos:
+            por_repo.setdefault(e.repo, []).append(t)
+    raiz_docs = DATOS / "docs"
+    if raiz_docs.is_dir():
+        for sub in raiz_docs.iterdir():
+            if sub.is_dir():
+                por_repo.setdefault(sub.name, [])
+
+    # Un repo puede no tener ni un ticket y participar de dos contratos
+    # -- dfv-automatizacion es el caso --. Sin ficha, la del tema apuntaria a un
+    # archivo que no existe, y el repo no se veria en el grafo aunque el
+    # ecosistema dependa de el.
+    conocidos = sorted({r.name for r in descubrir_repos()} | set(por_repo))
+    temas = {tm: _repos_del_tema(tm, conocidos) for tm in temas_de_contrato()}
+    for rs in temas.values():
+        for r in rs:
+            por_repo.setdefault(r, [])
+
+    citas: dict[str, set[str]] = {}
+    for t in ts:
+        for c in _contratos_citados(t):
+            if c in temas:
+                citas.setdefault(c, set()).add(t.slug)
+
+    escritas: list[Path] = []
+    resumen: list[tuple[str, int, int]] = []
+    for repo in sorted(por_repo):
+        suyos = sorted(por_repo[repo], key=lambda x: x.slug)
+        abiertos = [t for t in suyos if t.abierto]
+        cerrados = [t for t in suyos if not t.abierto]
+        docs = _docs_del_repo(repo)
+        # Por mencion en el contrato o por cita de un ticket: las dos cuentan,
+        # y la union es la que dibuja el puente entre dos constelaciones de repo.
+        contratos = sorted({tm for tm, rs in temas.items() if repo in rs}
+                           | {c for t in suyos for c in _contratos_citados(t)
+                              if c in temas})
+
+        y = yaml.safe_dump({"repo": repo, "abiertos": len(abiertos),
+                            "cerrados": len(cerrados)},
+                           sort_keys=False, allow_unicode=True).rstrip()
+        L = [f"---\n{y}\n---", "", f"# {repo}", "",
+             "Generado por `factoria board`. No se edita a mano: la fuente son los",
+             "tickets y `profiles/`. Esta para que el grafo agrupe; para consultar",
+             "estan `INDICE.md`, `tickets.base` y `factoria contexto <slug>`.", ""]
+        if abiertos:
+            L += ["## Tickets abiertos", ""]
+            L += [f"- [{t.slug}](../tickets/{t.slug}.md) — {t.fase}" for t in abiertos]
+            L += [""]
+        if cerrados:
+            L += ["## Tickets cerrados", ""]
+            L += [f"- [{t.slug}](../tickets/{t.slug}.md)" for t in cerrados]
+            L += [""]
+        if docs:
+            L += ["## Docs de trabajo", ""]
+            L += [f"- [{n}](../{ref})" for n, ref in docs]
+            L += [""]
+        if contratos:
+            L += ["## Contratos", ""]
+            L += [f"- [{c}](../temas/{c}.md)" for c in contratos]
+            L += [""]
+        L += ["[Mapa del vault](../MAPA.md)", ""]
+
+        p = d / _archivo_ficha(repo)
+        p.write_text("\n".join(L), encoding="utf-8", newline="\n")
+        escritas.append(p)
+        resumen.append((repo, len(abiertos), len(cerrados)))
+
+    # Una ficha de un repo que ya no tiene ni tickets ni docs queda como nodo
+    # muerto en el grafo, que es justo lo que estas notas vienen a sacar.
+    vigentes = {p.name for p in escritas}
+    for viejo in d.iterdir():
+        if viejo.is_file() and viejo.name not in vigentes:
+            viejo.unlink()
+
+    M = ["---", "generado_por: factoria board", "---", "", "# Mapa del vault", "",
+         "Generado por `factoria board`. No se edita a mano.", "",
+         "El centro son los docs core; cada ficha de repo agrupa sus tickets, sus",
+         "docs de trabajo y los contratos que citan. Es un mapa para mirar en el",
+         "grafo de Obsidian, no una fuente: nada de lo que dice vive solo aca.", "",
+         "## Core", ""]
+    M += [f"- [{etiqueta}]({ref}) — {que}" for etiqueta, ref, que in CORE_DEL_VAULT
+          if (DATOS / ref).exists()]
+    M += ["", "## Repos", ""]
+    M += [f"- [{r}](repos/{_archivo_ficha(r)}) — {_plural(a, 'abierto')}, "
+          f"{_plural(c, 'cerrado')}" for r, a, c in resumen]
+    escritas += regenerar_temas(temas, citas)
+    M += [""]
+    pm = DATOS / "MAPA.md"
+    pm.write_text("\n".join(M), encoding="utf-8", newline="\n")
+    escritas.append(pm)
+    return escritas
+
+
+def regenerar_temas(temas: dict[str, list[str]], citas: dict[str, set[str]]) -> list[Path]:
+    """Una ficha por contrato-tema. Junta las partes que el estandar separa.
+
+    El estandar parte cada integracion en tres archivos con cotas distintas
+    -- el caliente, `referencia/<tema>[/fichas]` y `historial/<tema>.md` -- y
+    eso esta bien para leer, pero deja las partes sin ningun link entre si: 66
+    de las 94 notas huerfanas del vault son pedazos de contrato. La ficha es el
+    unico lugar que las nombra juntas.
+
+    Va en `temas/` del vault y NO en `contratos/`, que es el canal compartido
+    con los otros repos: ahi adentro un archivo generado se le mezcla a un
+    agente con los que escribe `/handoff`.
+    """
+    d = DATOS / "temas"
+    d.mkdir(parents=True, exist_ok=True)
+    escritas: list[Path] = []
+    for tema in sorted(temas):
+        refs, hist = _partes_del_tema(tema)
+        repos = temas[tema]
+        slugs = sorted(citas.get(tema, ()))
+        y = yaml.safe_dump({"tema": tema, "repos": repos, "referencia": len(refs)},
+                           sort_keys=False, allow_unicode=True).rstrip()
+        L = [f"---\n{y}\n---", "", f"# {tema}", "",
+             "Generado por `factoria board`. No se edita a mano: junta las partes del",
+             "contrato para que el grafo las muestre como una sola cosa. Lo que se",
+             "acuerda se escribe en el contrato con `/handoff`, nunca aca.", "",
+             "## Contrato", "",
+             f"- [{tema}](../contratos/{tema}.md)", ""]
+        if refs:
+            L += ["## Referencia", ""]
+            L += [f"- [{n}](../{ref})" for n, ref in refs] + [""]
+        if hist:
+            L += ["## Historial", "", f"- [{tema}](../{hist})", ""]
+        if repos:
+            L += ["## Repos", ""]
+            L += [f"- [{r}](../repos/{_archivo_ficha(r)})" for r in repos] + [""]
+        if slugs:
+            L += ["## Tickets que lo citan", ""]
+            L += [f"- [{s}](../tickets/{s}.md)" for s in slugs] + [""]
+        L += ["[Mapa del vault](../MAPA.md)", ""]
+        p = d / f"{tema}.md"
+        p.write_text("\n".join(L), encoding="utf-8", newline="\n")
+        escritas.append(p)
+
+    vigentes = {p.name for p in escritas}
+    for viejo in d.iterdir():
+        if viejo.is_file() and viejo.name not in vigentes:
+            viejo.unlink()
+    return escritas
 
 
 # --------------------------------------------------------------------------
