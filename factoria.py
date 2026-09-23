@@ -3808,7 +3808,8 @@ def _seccion_epica(tk: Ticket) -> list[str]:
               + (f" -- {aviso}" if aviso else ""), ""]
     for n, t in enumerate(orden, 1):
         marca = " **(esta)**" if t.slug == tk.slug else ""
-        partes.append(f"{n}. `{t.slug}` -- {t.fase}{'' if t.abierto else ', cerrada'}{marca}")
+        cerrada = "" if t.abierto or t.fase == "cerrado" else ", cerrada"
+        partes.append(f"{n}. `{t.slug}` -- {t.fase}{cerrada}{marca}")
         if t.slug == tk.slug:
             continue
         for e in t.repos:
