@@ -656,3 +656,228 @@ def test_links_no_toca_skills_ni_agents(tmp_path, monkeypatch):
     monkeypatch.setattr(fx, "DATOS", vault)
     monkeypatch.setattr(fx, "CONTRATOS", vault / "contratos")
     assert fx.links_del_vault() == []
+
+
+# --------------------------------------------------------------------------
+# epicas: etapas encadenadas, con push por etapa o diferido al final
+# --------------------------------------------------------------------------
+
+import subprocess as _sp  # noqa: E402
+
+
+def _g(repo, *args):
+    r = _sp.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _commit(repo, archivo, texto="x"):
+    (repo / archivo).write_text(texto, encoding="utf-8")
+    _g(repo, "add", archivo)
+    _g(repo, "commit", "-q", "-m", f"toca {archivo}")
+
+
+@pytest.fixture
+def cadena(tmp_path, monkeypatch):
+    """Un repo con master, un remoto bare y un vault aislado. Devuelve helpers
+    para armar tickets de epica con ramas reales."""
+    remoto = tmp_path / "remoto.git"
+    _sp.run(["git", "init", "-q", "--bare", str(remoto)], check=True)
+    repo = tmp_path / "defeve"
+    repo.mkdir()
+    _g(repo, "init", "-q", "-b", "master")
+    _g(repo, "config", "user.email", "t@t")
+    _g(repo, "config", "user.name", "t")
+    _g(repo, "remote", "add", "origin", str(remoto))
+    _commit(repo, "base.txt")
+    vault = tmp_path / "vault"
+    (vault / "tickets").mkdir(parents=True)
+    monkeypatch.setattr(fx, "DATOS", vault)
+    monkeypatch.setattr(fx, "ruta_repo", lambda n: repo)
+    monkeypatch.setattr(fx, "repo_del_cwd", lambda: repo)
+    monkeypatch.setattr(fx, "perfil", lambda n: {"base": "master", "cuenta": "dfv"})
+    monkeypatch.setattr(fx, "regenerar_indice", lambda: None)
+    monkeypatch.setattr(fx, "espejar_si_se_puede", lambda t: None)
+    monkeypatch.setattr(fx, "crear_doc", lambda r, s: vault / "docs" / f"{s}.md")
+
+    def ticket(slug, rama="", **campos):
+        e = [fx.RepoTicket(repo="defeve", cuenta="dfv", rama=rama, cwd=str(repo))]
+        t = fx.Ticket(slug=slug, repos=e if rama else [], cuerpo="## Pedido crudo\nx\n",
+                      path=vault / "tickets" / f"{slug}.md", **campos)
+        fx.escribir_ticket(t)
+        return t
+
+    def rama(nombre, desde, archivo):
+        _g(repo, "checkout", "-q", "-b", nombre, desde)
+        _commit(repo, archivo)
+        _g(repo, "checkout", "-q", "master")
+
+    return type("C", (), {"repo": repo, "remoto": remoto, "ticket": staticmethod(ticket),
+                          "rama": staticmethod(rama)})
+
+
+def _en_remoto(c, rama):
+    return bool(_g(c.repo, "ls-remote", "origin", f"refs/heads/{rama}"))
+
+
+def test_los_campos_de_epica_sobreviven_al_ida_y_vuelta(tmp_path):
+    """El bug de partida: `regenerar_indice` reescribe todo ticket que no
+    coincide con `texto()`, y `texto()` salia de un dict fijo sin estas claves."""
+    t = fx.Ticket(slug="etapa2", epica="epi", continua_a="etapa1",
+                  push_etapas="por-etapa", cuerpo="## Pedido crudo\nx\n",
+                  path=tmp_path / "etapa2.md")
+    fx.escribir_ticket(t)
+    antes = t.path.read_bytes()
+    leido = fx.leer_ticket(t.path)
+    assert (leido.epica, leido.continua_a, leido.push_etapas) == (
+        "epi", "etapa1", "por-etapa")
+    assert leido.texto().encode("utf-8") == antes
+
+
+def test_un_ticket_sin_epica_no_estrena_claves_vacias():
+    """Emitirlas vacias reescribiria todos los tickets en el proximo `board`."""
+    txt = fx.Ticket(slug="suelto").texto()
+    assert "epica" not in txt and "continua_a" not in txt and "push_etapas" not in txt
+
+
+def test_sin_push_etapas_la_epica_es_al_final():
+    assert fx.modo_push(fx.Ticket(slug="e")) == "al-final"
+    assert fx.modo_push(fx.Ticket(slug="e", push_etapas="cualquiera")) == "al-final"
+    assert fx.modo_push(fx.Ticket(slug="e", push_etapas="por-etapa")) == "por-etapa"
+
+
+def test_la_cadena_se_ordena_por_continua_a_y_no_alfabetico():
+    ts = [fx.Ticket(slug="a-tercera", epica="e", continua_a="z-segunda"),
+          fx.Ticket(slug="m-primera", epica="e"),
+          fx.Ticket(slug="z-segunda", epica="e", continua_a="m-primera")]
+    orden, aviso = fx.ordenar_cadena(ts)
+    assert [t.slug for t in orden] == ["m-primera", "z-segunda", "a-tercera"]
+    assert not aviso
+
+
+@pytest.mark.parametrize("ts", [
+    [fx.Ticket(slug="b", epica="e"), fx.Ticket(slug="a", epica="e")],          # dos cabezas
+    [fx.Ticket(slug="b", epica="e", continua_a="a"),
+     fx.Ticket(slug="a", epica="e", continua_a="b")],                          # ciclo
+])
+def test_una_cadena_rota_ordena_alfabetico_y_avisa(ts):
+    orden, aviso = fx.ordenar_cadena(ts)
+    assert [t.slug for t in orden] == ["a", "b"]
+    assert aviso
+
+
+def test_las_etapas_se_listan_debajo_de_su_epica():
+    ts = [fx.Ticket(slug="b-etapa2", epica="m-epi", continua_a="z-etapa1"),
+          fx.Ticket(slug="a-suelto"), fx.Ticket(slug="m-epi"),
+          fx.Ticket(slug="z-etapa1", epica="m-epi")]
+    filas = [(t.slug, etapa) for t, etapa in fx.orden_con_etapas(ts, lambda x: x.slug)]
+    assert filas == [("a-suelto", False), ("m-epi", False),
+                     ("z-etapa1", True), ("b-etapa2", True)]
+
+
+def test_la_base_de_una_etapa_es_la_rama_de_la_anterior(cadena):
+    cadena.rama("feature/etapa1", "master", "uno.txt")
+    t1 = cadena.ticket("etapa1", "feature/etapa1", epica="epi")
+    t2 = fx.Ticket(slug="etapa2", epica="epi", continua_a="etapa1")
+    assert fx.base_de_ticket(t2, "defeve", cadena.repo, "master", [t1]) == "feature/etapa1"
+    # mergeada y borrada: cae con gracia al base del perfil
+    _g(cadena.repo, "branch", "-D", "feature/etapa1")
+    assert fx.base_de_ticket(t2, "defeve", cadena.repo, "master", [t1]) == "master"
+
+
+def test_new_continua_nace_de_la_rama_de_la_etapa_anterior(cadena):
+    cadena.ticket("epi")
+    cadena.rama("feature/etapa1", "master", "uno.txt")
+    cadena.ticket("etapa1", "feature/etapa1", epica="epi")
+    r = CliRunner().invoke(fx.cli, ["new", "etapa2", "--continua", "etapa1",
+                                    "--pedido", "sigue", "--no-lanzar"])
+    assert r.exit_code == 0, r.output
+    t2 = fx.buscar_ticket("etapa2")
+    assert (t2.epica, t2.continua_a) == ("epi", "etapa1")   # la epica se hereda
+    assert t2.repos[0].rama == "feature/etapa2"
+    _g(cadena.repo, "merge-base", "--is-ancestor", "feature/etapa1", "feature/etapa2")
+
+
+def test_new_continua_sin_epica_no_adivina(cadena):
+    cadena.rama("feature/suelta", "master", "uno.txt")
+    cadena.ticket("suelta", "feature/suelta")
+    r = CliRunner().invoke(fx.cli, ["new", "otra", "--continua", "suelta",
+                                    "--pedido", "x", "--no-lanzar"])
+    assert r.exit_code != 0
+    assert "--epica" in r.output
+
+
+def test_el_grafo_no_le_atribuye_a_la_etapa2_lo_de_la_etapa1(cadena):
+    cadena.rama("feature/etapa1", "master", "uno.txt")
+    _g(cadena.repo, "checkout", "-q", "-b", "feature/etapa2", "feature/etapa1")
+    _commit(cadena.repo, "dos.txt")
+    _g(cadena.repo, "checkout", "-q", "master")
+    t1 = cadena.ticket("etapa1", "feature/etapa1", epica="epi")
+    t2 = fx.Ticket(slug="etapa2", epica="epi", continua_a="etapa1")
+    exacta = fx.base_de_ticket(t2, "defeve", cadena.repo, "master", [t1])
+    cache: dict = {}
+    assert fx.archivos_de_rama(cadena.repo, "feature/etapa2", "master", cache,
+                               exacta) == ["dos.txt"]
+    # y el cache no le devuelve a la version adivinada lo que calculo la exacta
+    assert fx.archivos_de_rama(cadena.repo, "feature/etapa2", "master",
+                               cache) == ["dos.txt", "uno.txt"]
+
+
+def _epica_de_dos(cadena, modo=""):
+    cadena.ticket("epi", push_etapas=modo)
+    cadena.rama("feature/etapa1", "master", "uno.txt")
+    _g(cadena.repo, "checkout", "-q", "-b", "feature/etapa2", "feature/etapa1")
+    _commit(cadena.repo, "dos.txt")
+    _g(cadena.repo, "checkout", "-q", "master")
+    cadena.ticket("etapa1", "feature/etapa1", epica="epi")
+    cadena.ticket("etapa2", "feature/etapa2", epica="epi", continua_a="etapa1")
+
+
+def _close(*args):
+    r = CliRunner().invoke(fx.cli, ["close", *args])
+    assert r.exit_code == 0, r.output
+    # rich parte las lineas largas al ancho de la consola de prueba
+    return r.output.replace("\n", "")
+
+
+def test_al_final_la_intermedia_no_pushea_y_la_ultima_pushea_la_cadena(cadena):
+    _epica_de_dos(cadena)               # sin push_etapas: al-final
+    out1 = _close("etapa1")
+    assert "push diferido" in out1
+    assert "compare" not in out1 and "branch -d" not in out1
+    assert not _en_remoto(cadena, "feature/etapa1")
+    assert "queda lista para cerrar" not in out1
+
+    out2 = _close("etapa2")
+    assert _en_remoto(cadena, "feature/etapa2")
+    assert not _en_remoto(cadena, "feature/etapa1")
+    assert "compare/master...feature/etapa2" in out2
+    assert "branch -d feature/etapa1" in out2     # la intermedia, despues del merge
+    assert "epica epi" in out2 and "queda lista para cerrar" in out2
+
+
+def test_por_etapa_cada_una_pushea_contra_la_anterior(cadena):
+    _epica_de_dos(cadena, "por-etapa")
+    out1 = _close("etapa1")
+    assert _en_remoto(cadena, "feature/etapa1")
+    assert "compare/master...feature/etapa1" in out1
+    out2 = _close("etapa2")
+    assert "compare/feature/etapa1...feature/etapa2" in out2
+
+
+def test_pushear_explicito_le_gana_al_modo(cadena):
+    _epica_de_dos(cadena)
+    _close("etapa1", "--pushear")
+    assert _en_remoto(cadena, "feature/etapa1")
+
+
+def test_board_no_marca_como_riesgo_una_rama_con_push_diferido():
+    ts = [fx.Ticket(slug="epi"),
+          fx.Ticket(slug="etapa1", epica="epi", repos=[
+              fx.RepoTicket(repo="defeve", cuenta="dfv", rama="feature/etapa1")])]
+    rel = fx.Relevamiento(tickets=ts, bases={"defeve": "master"}, ramas=[
+        fx.Rama("defeve", "feature/etapa1", 1, False),
+        fx.Rama("defeve", "feature/olvidada", 1, False)])
+    h = "\n".join(fx.hallazgos(rel))
+    assert "1 ramas solo existen en este disco" in h
+    assert "push diferido" in h and "feature/etapa1" in h
