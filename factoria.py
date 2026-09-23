@@ -2659,10 +2659,16 @@ def cuerpo_issue(t: Ticket) -> str:
     ]
     for e in t.repos:
         partes.append(f"- `{e.repo}` ({e.cuenta}) — rama `{e.rama or '?'}`")
+    # `close` deja el cuerpo en una linea y recien despues espeja: sin esto el
+    # issue de un ticket cerrado queda con todas las secciones en _(vacío)_.
+    fuente = t.cuerpo
+    hist = DATOS / "historial" / f"{t.slug}.md"
+    if not t.abierto and hist.is_file():
+        fuente = hist.read_text(encoding="utf-8", errors="replace")
     for enc in ("## Pedido crudo", "## Criterios de aceptación",
                 "## Fuera de alcance", "## Entregables de código",
                 "## Supuestos abiertos"):
-        cuerpo = _seccion(t.cuerpo, enc)
+        cuerpo = _seccion(fuente, enc)
         partes += ["", enc.replace("## ", "### "), "", cuerpo or "_(vacío)_"]
     return "\n".join(partes)
 
