@@ -770,19 +770,39 @@ def test_las_etapas_se_listan_debajo_de_su_epica():
     ts = [fx.Ticket(slug="b-etapa2", epica="m-epi", continua_a="z-etapa1"),
           fx.Ticket(slug="a-suelto"), fx.Ticket(slug="m-epi"),
           fx.Ticket(slug="z-etapa1", epica="m-epi")]
-    filas = [(t.slug, etapa) for t, etapa in fx.orden_con_etapas(ts, lambda x: x.slug)]
-    assert filas == [("a-suelto", False), ("m-epi", False),
-                     ("z-etapa1", True), ("b-etapa2", True)]
+    filas, avisos = fx.orden_con_etapas(ts, lambda x: x.slug)
+    assert [(t.slug, etapa) for t, etapa in filas] == [
+        ("a-suelto", False), ("m-epi", False), ("z-etapa1", True), ("b-etapa2", True)]
+    assert not avisos
+
+
+def test_una_etapa_del_medio_cerrada_no_rompe_el_orden_de_las_abiertas():
+    """`board` solo muestra abiertas: sin la cerrada del medio, la 1 y la 3
+    parecian dos cabezas y se ordenaban alfabetico en silencio."""
+    todos = [fx.Ticket(slug="epi"), fx.Ticket(slug="z-uno", epica="epi"),
+             fx.Ticket(slug="m-dos", epica="epi", continua_a="z-uno", abierto=False),
+             fx.Ticket(slug="a-tres", epica="epi", continua_a="m-dos")]
+    abiertos = [t for t in todos if t.abierto]
+    filas, avisos = fx.orden_con_etapas(abiertos, lambda x: x.slug, todos)
+    assert [t.slug for t, _ in filas] == ["epi", "z-uno", "a-tres"]
+    assert not avisos
+
+
+def test_una_cadena_rota_se_avisa_en_el_listado():
+    ts = [fx.Ticket(slug="epi"), fx.Ticket(slug="b", epica="epi"),
+          fx.Ticket(slug="a", epica="epi")]
+    _, avisos = fx.orden_con_etapas(ts, lambda x: x.slug)
+    assert avisos and "epica epi" in avisos[0]
 
 
 def test_la_base_de_una_etapa_es_la_rama_de_la_anterior(cadena):
     cadena.rama("feature/etapa1", "master", "uno.txt")
     t1 = cadena.ticket("etapa1", "feature/etapa1", epica="epi")
     t2 = fx.Ticket(slug="etapa2", epica="epi", continua_a="etapa1")
-    assert fx.base_de_ticket(t2, "defeve", cadena.repo, "master", [t1]) == "feature/etapa1"
+    assert fx.base_de_ticket(t2, cadena.repo, "master", [t1]) == "feature/etapa1"
     # mergeada y borrada: cae con gracia al base del perfil
     _g(cadena.repo, "branch", "-D", "feature/etapa1")
-    assert fx.base_de_ticket(t2, "defeve", cadena.repo, "master", [t1]) == "master"
+    assert fx.base_de_ticket(t2, cadena.repo, "master", [t1]) == "master"
 
 
 def test_new_continua_nace_de_la_rama_de_la_etapa_anterior(cadena):
@@ -798,13 +818,17 @@ def test_new_continua_nace_de_la_rama_de_la_etapa_anterior(cadena):
     _g(cadena.repo, "merge-base", "--is-ancestor", "feature/etapa1", "feature/etapa2")
 
 
-def test_new_continua_sin_epica_no_adivina(cadena):
+def test_new_continua_sin_epica_avisa_y_encadena_igual(cadena):
+    """Avisa, no bloquea: factoria solo bloquea en `aprobar`."""
     cadena.rama("feature/suelta", "master", "uno.txt")
     cadena.ticket("suelta", "feature/suelta")
     r = CliRunner().invoke(fx.cli, ["new", "otra", "--continua", "suelta",
                                     "--pedido", "x", "--no-lanzar"])
-    assert r.exit_code != 0
+    assert r.exit_code == 0, r.output
     assert "--epica" in r.output
+    t = fx.buscar_ticket("otra")
+    assert (t.epica, t.continua_a) == ("", "suelta")
+    _g(cadena.repo, "merge-base", "--is-ancestor", "feature/suelta", "feature/otra")
 
 
 def test_el_grafo_no_le_atribuye_a_la_etapa2_lo_de_la_etapa1(cadena):
@@ -814,7 +838,7 @@ def test_el_grafo_no_le_atribuye_a_la_etapa2_lo_de_la_etapa1(cadena):
     _g(cadena.repo, "checkout", "-q", "master")
     t1 = cadena.ticket("etapa1", "feature/etapa1", epica="epi")
     t2 = fx.Ticket(slug="etapa2", epica="epi", continua_a="etapa1")
-    exacta = fx.base_de_ticket(t2, "defeve", cadena.repo, "master", [t1])
+    exacta = fx.base_de_ticket(t2, cadena.repo, "master", [t1])
     cache: dict = {}
     assert fx.archivos_de_rama(cadena.repo, "feature/etapa2", "master", cache,
                                exacta) == ["dos.txt"]
@@ -869,6 +893,59 @@ def test_pushear_explicito_le_gana_al_modo(cadena):
     _epica_de_dos(cadena)
     _close("etapa1", "--pushear")
     assert _en_remoto(cadena, "feature/etapa1")
+
+
+def test_el_compare_no_apunta_a_una_etapa_que_no_esta_en_el_remoto(cadena):
+    """`--pushear` sobre la etapa 2 con la 1 diferida: el compare contra
+    feature/etapa1 seria un link muerto."""
+    cadena.ticket("epi")
+    cadena.rama("feature/etapa1", "master", "uno.txt")
+    _g(cadena.repo, "checkout", "-q", "-b", "feature/etapa2", "feature/etapa1")
+    _commit(cadena.repo, "dos.txt")
+    _g(cadena.repo, "checkout", "-q", "master")
+    cadena.ticket("etapa1", "feature/etapa1", epica="epi")
+    cadena.ticket("etapa2", "feature/etapa2", epica="epi", continua_a="etapa1")
+    cadena.ticket("etapa3", "feature/etapa2", epica="epi", continua_a="etapa2")
+    out = _close("etapa2", "--pushear")
+    assert "compare/master...feature/etapa2" in out
+    assert "compare/feature/etapa1" not in out
+
+
+def test_cerrar_fuera_de_orden_avisa_la_etapa_que_quedo_sin_push(cadena):
+    """La 3 se cierra (diferida) antes que la 2: la 2 cierra la cadena, y su
+    rama no contiene a la 3. Sin el aviso, ese trabajo quedaba solo en disco."""
+    cadena.ticket("epi")
+    cadena.rama("feature/etapa1", "master", "uno.txt")
+    _g(cadena.repo, "checkout", "-q", "-b", "feature/etapa2", "feature/etapa1")
+    _commit(cadena.repo, "dos.txt")
+    _g(cadena.repo, "checkout", "-q", "-b", "feature/etapa3", "feature/etapa2")
+    _commit(cadena.repo, "tres.txt")
+    _g(cadena.repo, "checkout", "-q", "master")
+    cadena.ticket("etapa1", "feature/etapa1", epica="epi", abierto=False)
+    cadena.ticket("etapa2", "feature/etapa2", epica="epi", continua_a="etapa1")
+    cadena.ticket("etapa3", "feature/etapa3", epica="epi", continua_a="etapa2")
+    assert "push diferido" in _close("etapa3")
+    out = _close("etapa2")
+    assert "no quedaron en la rama pusheada" in out
+    assert "push -u origin feature/etapa3" in out
+    assert "branch -d feature/etapa1" in out          # esa si quedo contenida
+    assert "branch -d feature/etapa3" not in out
+
+
+def test_cerrada_la_cadena_una_etapa_sin_respaldo_vuelve_a_ser_riesgo(cadena):
+    """Diferida mientras la cadena viva; despues, solo si quedo contenida en una
+    rama pusheada. Si no, `board` la disculparia para siempre."""
+    _epica_de_dos(cadena)
+    _close("etapa1")
+    repos = {"defeve": cadena.repo}
+    ts = fx.tickets_todos()
+    assert ("defeve", "feature/etapa1") in fx.ramas_diferidas(ts, repos)
+    _close("etapa2")
+    ts = fx.tickets_todos()
+    # contenida en feature/etapa2, que esta en el remoto: sigue disculpada
+    assert ("defeve", "feature/etapa1") in fx.ramas_diferidas(ts, repos)
+    _g(cadena.repo, "push", "-q", "origin", "--delete", "feature/etapa2")
+    assert ("defeve", "feature/etapa1") not in fx.ramas_diferidas(ts, repos)
 
 
 def test_board_no_marca_como_riesgo_una_rama_con_push_diferido():

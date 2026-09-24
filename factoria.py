@@ -637,18 +637,15 @@ def hallazgos(rel: Relevamiento) -> list[str]:
 
     # Las etapas de una epica `al-final` no se pushean a proposito: marcarlas
     # como riesgo rojo mezclaria lo diferido con lo olvidado.
-    diferidas = ramas_diferidas(rel.tickets)
-    sin_push = [r for r in rel.ramas if not r.pusheada
-                and (r.repo, r.nombre) not in diferidas]
-    en_espera = [r for r in rel.ramas if not r.pusheada
-                 and (r.repo, r.nombre) in diferidas]
+    diferidas = ramas_diferidas(rel.tickets, {r.name: r for r in rel.repos})
+    sin_push = [r for r in rel.ramas if estado_push(r, diferidas) == "no"]
+    en_espera = [r for r in rel.ramas if estado_push(r, diferidas) == "diferido"]
     por_repo: dict[str, list[Rama]] = {}
     for r in rel.ramas:
         por_repo.setdefault(r.repo, []).append(r)
     for repo, ramas in sorted(por_repo.items(), key=lambda t: -len(t[1])):
         vieja = max(ramas, key=lambda r: r.dias)
-        npush = sum(1 for r in ramas if not r.pusheada
-                    and (r.repo, r.nombre) not in diferidas)
+        npush = sum(1 for r in ramas if estado_push(r, diferidas) == "no")
         h.append(
             f"[yellow]{repo}[/]: {len(ramas)} ramas sin mergear a "
             f"'{rel.bases.get(repo, '?')}', la mas vieja de {vieja.dias}d "
@@ -850,8 +847,9 @@ def hallazgos(rel: Relevamiento) -> list[str]:
         )
     if en_espera:
         h.append(
-            f"[dim]push diferido[/] {len(en_espera)} ramas de etapas esperan el cierre "
-            "de su epica (al-final): " + ", ".join(r.nombre for r in en_espera[:4])
+            f"[dim]push diferido[/] {len(en_espera)} ramas de etapas de epicas al-final, "
+            "esperando el cierre de la cadena o ya contenidas en la rama pusheada: "
+            + ", ".join(r.nombre for r in en_espera[:4])
         )
     return h
 
@@ -908,13 +906,17 @@ def board(docs: bool, ramas: bool, sesiones: bool, limite: int, como_json: bool)
         t.add_column("repos")
         t.add_column("ses")
         t.add_column("lin", justify="right")
-        clave = lambda x: (FASES.index(x.fase) if x.fase in FASES else 9, x.slug)  # noqa: E731
-        for tk, es_etapa in orden_con_etapas(abiertos, clave)[:limite]:
+        def clave(x: Ticket) -> tuple[int, str]:
+            return (FASES.index(x.fase) if x.fase in FASES else 9, x.slug)
+        filas, avisos = orden_con_etapas(abiertos, clave, rel.tickets)
+        for tk, es_etapa in filas[:limite]:
             con_ses = sum(1 for e in tk.repos if e.session_id)
             t.add_row(f"  └ {tk.slug}" if es_etapa else tk.slug, tk.fase,
                       ", ".join(f"{e.repo}({e.cuenta})" for e in tk.repos) or "[red]-[/]",
                       f"{con_ses}/{len(tk.repos)}", str(tk.lineas))
         console.print(t)
+        for a in avisos:
+            console.print(f"  [yellow]{a}[/]")
 
     # El indice se regenera aca y no en cada `new`/`fase`: es derivado.
     regenerar_indice()
@@ -945,11 +947,10 @@ def board(docs: bool, ramas: bool, sesiones: bool, limite: int, como_json: bool)
         t = Table(title="Ramas sin mergear", title_justify="left", header_style="bold")
         for c in ("repo", "rama", "dias", "push"):
             t.add_column(c, justify="right" if c == "dias" else "left")
-        diferidas = ramas_diferidas(rel.tickets)
+        diferidas = ramas_diferidas(rel.tickets, {r.name: r for r in rel.repos})
         for r in rel.ramas[:limite]:
-            push = ("si" if r.pusheada else "diferido" if (r.repo, r.nombre) in diferidas
-                    else "[red]NO[/]")
-            t.add_row(r.repo, r.nombre, str(r.dias), push)
+            push = estado_push(r, diferidas)
+            t.add_row(r.repo, r.nombre, str(r.dias), "[red]NO[/]" if push == "no" else push)
         console.print(t)
         if len(rel.ramas) > limite:
             console.print(f"  [dim]... y {len(rel.ramas) - limite} ramas mas[/]")
@@ -1578,7 +1579,7 @@ class Ticket:
             "issue": self.issue,
             "issue_url": self.issue_url,
             "proyecto_item": self.proyecto_item,
-            # Solo si tienen valor: emitirlos vacios reescribiria los 47 tickets
+            # Solo si tienen valor: emitirlos vacios reescribiria todos los tickets
             # que no son de ninguna epica en el proximo `board`, sin cambiar nada.
             **{k: v for k in ("epica", "continua_a", "push_etapas")
                if (v := getattr(self, k))},
@@ -1690,13 +1691,17 @@ def buscar_ticket(slug: str) -> Ticket:
 # que por estar encadenada ya contiene toda la cadena, y abre UN solo PR contra
 # el `base:` del perfil. Es el default. `por-etapa`: cada etapa se pushea al
 # cerrarla, con el compare contra la rama de la anterior.
-PUSH_ETAPAS = ("al-final", "por-etapa")
+AL_FINAL, POR_ETAPA = PUSH_ETAPAS = ("al-final", "por-etapa")
 
 
 def modo_push(epica: Ticket | None) -> str:
     """El modo de la epica; sin el campo, o con un valor mal escrito, `al-final`."""
     m = epica.push_etapas if epica else ""
-    return m if m in PUSH_ETAPAS else "al-final"
+    return m if m in PUSH_ETAPAS else AL_FINAL
+
+
+def ticket_por_slug(ts: list[Ticket], slug: str) -> Ticket | None:
+    return next((x for x in ts if x.slug == slug), None) if slug else None
 
 
 def ordenar_cadena(etapas: list[Ticket]) -> tuple[list[Ticket], str]:
@@ -1706,6 +1711,8 @@ def ordenar_cadena(etapas: list[Ticket]) -> tuple[list[Ticket], str]:
     continuar a la epica, o a nada). Si la cadena no es lineal --dos cabezas,
     un ciclo, un puntero roto que deja etapas afuera-- devuelve orden alfabetico
     y el aviso: ordenar mal en silencio es peor que ordenar alfabetico avisando.
+    Por eso se le pasa la cadena ENTERA, cerradas incluidas: sin la etapa 2
+    cerrada, la 1 y la 3 abiertas parecen dos cabezas.
     """
     por_slug = {t.slug: t for t in etapas}
     alfabetico = sorted(etapas, key=lambda t: t.slug)
@@ -1725,53 +1732,96 @@ def ordenar_cadena(etapas: list[Ticket]) -> tuple[list[Ticket], str]:
     return orden, ""
 
 
-def etapas_de(epica: str, ts: list[Ticket] | None = None) -> list[Ticket]:
-    """Las etapas de una epica, abiertas y cerradas, en orden de cadena."""
-    ts = tickets_todos() if ts is None else ts
-    return ordenar_cadena([t for t in ts if t.epica == epica])[0]
+def etapas_de(epica: str, ts: list[Ticket]) -> tuple[list[Ticket], str]:
+    """Las etapas de una epica, abiertas y cerradas, en orden de cadena, y el
+    aviso si la cadena esta rota."""
+    return ordenar_cadena([t for t in ts if t.epica == epica])
 
 
-def base_de_ticket(t: Ticket, repo: str, rp: Path, base_perfil: str,
-                   ts: list[Ticket] | None = None) -> str:
-    """La base real de la rama de un ticket en un repo.
+def rama_viva(t: Ticket | None, rp: Path, base_perfil: str) -> str:
+    """La rama de `t` en ese repo si sigue en disco; si no, el `base:` del perfil.
 
-    La rama del ticket al que continua, si sigue existiendo en disco; si no --no
-    continua a nadie, o la anterior ya se mergeo y se borro-- el `base:` del
-    perfil. Sin esto el diff de la etapa 2 sale contra master y le atribuye
-    todos los archivos de la etapa 1.
+    El caso del "si no" es real: la etapa anterior ya se mergeo y su rama se
+    borro, y la siguiente tiene que caer con gracia en vez de fallar.
     """
-    if t.continua_a:
-        ts = tickets_todos() if ts is None else ts
-        previo = next((x for x in ts if x.slug == t.continua_a), None)
-        e = previo.entrada(repo) if previo else None
-        if e and e.rama and e.rama != base_perfil and existe_rama(rp, e.rama):
-            return e.rama
+    e = t.entrada(rp.name) if t else None
+    if e and e.rama and e.rama != base_perfil and existe_rama(rp, e.rama):
+        return e.rama
     return base_perfil
 
 
-def ramas_diferidas(ts: list[Ticket]) -> set[tuple[str, str]]:
-    """(repo, rama) de las etapas de epicas `al-final`: sin push a proposito."""
-    epicas = {t.slug: t for t in ts}
-    return {(e.repo, e.rama) for t in ts if t.epica
-            and modo_push(epicas.get(t.epica)) == "al-final"
-            for e in t.repos if e.rama}
+def base_de_ticket(t: Ticket, rp: Path, base_perfil: str, ts: list[Ticket]) -> str:
+    """La base real de la rama de un ticket: la de la etapa a la que continua.
 
-
-def orden_con_etapas(ts: list[Ticket], clave) -> list[tuple[Ticket, bool]]:
-    """(ticket, es_etapa): cada epica seguida de sus etapas en orden de cadena.
-
-    Las etapas cuya epica no esta en la lista (cerrada, o de otro filtro) quedan
-    sueltas, ordenadas por `clave` como cualquier ticket.
+    Sin esto el diff de la etapa 2 sale contra master y le atribuye todos los
+    archivos de la etapa 1.
     """
-    presentes = {t.slug for t in ts}
-    colgadas = [t for t in ts if t.epica in presentes and t.epica != t.slug]
-    ids = {id(t) for t in colgadas}
-    out: list[tuple[Ticket, bool]] = []
-    for t in sorted((t for t in ts if id(t) not in ids), key=clave):
-        out.append((t, False))
-        hijas = [x for x in colgadas if x.epica == t.slug]
-        out += [(x, True) for x in ordenar_cadena(hijas)[0]]
+    return rama_viva(ticket_por_slug(ts, t.continua_a), rp, base_perfil)
+
+
+def en_remoto(rp: Path, rama: str) -> bool:
+    return bool(git(rp, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{rama}"))
+
+
+def ramas_diferidas(ts: list[Ticket], repos: dict[str, Path]) -> set[tuple[str, str]]:
+    """(repo, rama) de etapas de epicas `al-final` que estan sin push a proposito.
+
+    Lo estan mientras a la cadena le quede una etapa abierta. Cerrada la
+    cadena, solo las que quedaron contenidas en una rama pusheada de otra etapa:
+    las demas son trabajo que no llego al remoto, y `board` tiene que volver a
+    marcarlas en rojo en vez de disculparlas para siempre.
+    """
+    out: set[tuple[str, str]] = set()
+    for slug in {t.epica for t in ts if t.epica}:
+        if modo_push(ticket_por_slug(ts, slug)) != AL_FINAL:
+            continue
+        etapas = [t for t in ts if t.epica == slug]
+        viva = any(t.abierto for t in etapas)
+        for t in etapas:
+            for e in t.repos:
+                rp = repos.get(e.repo)
+                if not e.rama:
+                    continue
+                if viva or rp and any(_es_ancestro(rp, e.rama, o.rama) and en_remoto(rp, o.rama)
+                                      for x in etapas if x is not t
+                                      for o in x.repos if o.repo == e.repo and o.rama):
+                    out.add((e.repo, e.rama))
     return out
+
+
+def estado_push(r: Rama, diferidas: set[tuple[str, str]]) -> str:
+    """`si`, `diferido` (etapa de una epica al-final) o `no` (solo en disco)."""
+    if r.pusheada:
+        return "si"
+    return "diferido" if (r.repo, r.nombre) in diferidas else "no"
+
+
+def orden_con_etapas(ts: list[Ticket], clave,
+                     todos: list[Ticket] | None = None
+                     ) -> tuple[list[tuple[Ticket, bool]], list[str]]:
+    """(ticket, es_etapa) con cada epica seguida de sus etapas en orden de
+    cadena, y los avisos de las cadenas rotas.
+
+    El orden sale de la cadena completa (`todos`), no de las filas que se
+    muestran. Las etapas cuya epica no esta en la lista (cerrada, o de otro
+    filtro) quedan sueltas, ordenadas por `clave` como cualquier ticket.
+    """
+    todos = ts if todos is None else todos
+    presentes = {id(t) for t in ts}
+    slugs = {t.slug for t in ts}
+    colgadas = {id(t) for t in ts if t.epica in slugs and t.epica != t.slug}
+    out: list[tuple[Ticket, bool]] = []
+    avisos: list[str] = []
+    por_slug = {t.slug: t for t in ts}
+    for t in sorted((t for t in ts if id(t) not in colgadas), key=clave):
+        out.append((t, False))
+        cadena, aviso = etapas_de(t.slug, todos)
+        if aviso and cadena:
+            avisos.append(f"epica {t.slug}: {aviso}")
+        # `todos` puede traer otra instancia del mismo ticket: se muestra la de `ts`.
+        out += [(por_slug[x.slug], True) for x in cadena
+                if x.slug in por_slug and id(por_slug[x.slug]) in presentes]
+    return out, avisos
 
 
 # --------------------------------------------------------------------------
@@ -2426,9 +2476,10 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     elif previo:
         epica = previo.epica or None
     if continua and not epica:
-        raise click.ClickException(
-            f"'{previo.slug}' no pertenece a ninguna epica: pasá --epica <slug>."
-        )
+        # Avisa, no bloquea: la rama se encadena igual, pero sin epica no hay
+        # agrupado en `board` ni push diferido.
+        console.print(f"[yellow]'{previo.slug}' no pertenece a ninguna epica: la rama "
+                      "se encadena, pero sin --epica no se agrupa ni difiere el push.[/]")
     if push_etapas and epica:
         console.print("[yellow]--push-etapas va en la epica, no en una etapa: en esta "
                       "no tiene efecto.[/]")
@@ -2452,8 +2503,7 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     if previo:
         # Encadenada: nace de la rama de la etapa anterior. Si esa ya no esta en
         # disco (mergeada y borrada), cae al `base:` del perfil avisando.
-        desde = base_de_ticket(Ticket(slug=slug, continua_a=previo.slug), rp.name,
-                               rp, base, [previo])
+        desde = rama_viva(previo, rp, base)
         if desde == base:
             console.print(f"[yellow]'{previo.slug}' no tiene rama en {rp.name}: la "
                           f"etapa nace de {base or '(sin base)'}.[/]")
@@ -2683,7 +2733,8 @@ def tickets(todos: bool, como_json: bool) -> None:
     t_.add_column("ses")
     t_.add_column("issue")
     t_.add_column("lin", justify="right")
-    for t, es_etapa in orden_con_etapas(ts, lambda x: x.slug):
+    filas, avisos = orden_con_etapas(ts, lambda x: x.slug, tickets_todos())
+    for t, es_etapa in filas:
         nombre = f"└ {t.slug}" if es_etapa else t.slug
         if not t.repos:
             t_.add_row(nombre, t.fase, "[red]-[/]", "-", "-", "-",
@@ -2697,6 +2748,8 @@ def tickets(todos: bool, como_json: bool) -> None:
                        (f"#{t.issue}" if t.issue else "[dim]-[/]") if i == 0 else "",
                        str(t.lineas) if i == 0 else "")
     console.print(t_)
+    for a in avisos:
+        console.print(f"  [yellow]{a}[/]")
     console.print()
 
 
@@ -3561,8 +3614,8 @@ def construir_grafo(reconstruir: bool = False) -> dict:
             rp, base = repos.get(e.repo), bases.get(e.repo, "")
             exacta = ""
             if rp and t.continua_a:
-                b = base_de_ticket(t, e.repo, rp, base, ts)
-                exacta = b if b != base else ""
+                b = base_de_ticket(t, rp, base, ts)
+                exacta = b if b != base else ""   # "" = que la adivine base_efectiva
             enlazar_trabajo(tid, e.repo, e.rama, texto, exacta)
 
     # --- docs de trabajo preexistentes: son 125 contra 1 ticket, asi que sin
@@ -3798,11 +3851,10 @@ def _seccion_epica(tk: Ticket) -> list[str]:
     """
     ts = tickets_todos()
     slug = tk.epica or tk.slug
-    etapas = [t for t in ts if t.epica == slug]
-    if not etapas:
+    orden, aviso = etapas_de(slug, ts)
+    if not orden:
         return []
-    orden, aviso = ordenar_cadena(etapas)
-    epica = next((t for t in ts if t.slug == slug), None)
+    epica = ticket_por_slug(ts, slug)
     partes = ["---", "", f"## Epica {slug}", "",
               f"_push de etapas: {modo_push(epica)}_"
               + (f" -- {aviso}" if aviso else ""), ""]
@@ -4315,6 +4367,66 @@ def _pasos_manuales(slug: str, rp: Path, trabajo: Path, e: RepoTicket, base: str
     return pasos
 
 
+@dataclass
+class PlanPush:
+    """Que hace `close` con el push de un ticket, segun su epica."""
+    etapas: list[Ticket] = field(default_factory=list)
+    abiertas: list[Ticket] = field(default_factory=list)
+    modo: str = ""
+    # No queda otra etapa abierta en la epica. No es "la ultima de la cadena":
+    # si se cerraron fuera de orden, la que cierra la cadena puede ser del medio.
+    cierra_cadena: bool = False
+    aviso: str = ""
+
+    @property
+    def diferido(self) -> bool:
+        return self.modo == AL_FINAL and not self.cierra_cadena
+
+    @property
+    def push_final(self) -> bool:
+        """El push unico de `al-final`: su compare va contra el base del perfil."""
+        return self.modo == AL_FINAL and self.cierra_cadena
+
+
+def plan_de_push(t: Ticket, ts: list[Ticket]) -> PlanPush:
+    if not t.epica:
+        return PlanPush()
+    etapas, aviso = etapas_de(t.epica, ts)
+    abiertas = [x for x in etapas if x.abierto and x.slug != t.slug]
+    return PlanPush(etapas=etapas, abiertas=abiertas,
+                    modo=modo_push(ticket_por_slug(ts, t.epica)),
+                    cierra_cadena=not abiertas, aviso=aviso)
+
+
+def _ramas_de_etapas(etapas: list[Ticket], t: Ticket,
+                     repo: str | None = None) -> list[tuple[str, Path]]:
+    """(rama, repo en disco) de las OTRAS etapas, que sigan existiendo local."""
+    out = []
+    for x in etapas:
+        if x.slug == t.slug:
+            continue
+        for ex in x.repos:
+            if repo and ex.repo != repo:
+                continue
+            rp = ruta_repo(ex.repo)
+            if ex.rama and rp and existe_rama(rp, ex.rama):
+                out.append((ex.rama, rp))
+    return out
+
+
+def _etapas_sin_respaldo(plan: PlanPush, t: Ticket) -> list[tuple[str, Path]]:
+    """Ramas de otras etapas que no estan en el remoto ni contenidas en una
+    rama pusheada de `t`."""
+    out = []
+    for r, rp in _ramas_de_etapas(plan.etapas, t):
+        if en_remoto(rp, r):
+            continue
+        propias = [e.rama for e in t.repos if e.rama and ruta_repo(e.repo) == rp]
+        if not any(en_remoto(rp, p) and _es_ancestro(rp, r, p) for p in propias):
+            out.append((r, rp))
+    return out
+
+
 @cli.command("close")
 @click.argument("slug")
 @click.option("--repo", help="Cerrar solo la entrada de un repo.")
@@ -4332,14 +4444,12 @@ def close_cmd(slug: str, repo: str | None, pushear: bool | None,
         raise click.ClickException(f"'{t.slug}' no tiene entrada para --repo {repo}.")
 
     ts = tickets_todos()
-    epica = next((x for x in ts if x.slug == t.epica), None) if t.epica else None
-    etapas = etapas_de(t.epica, ts) if t.epica else []
-    abiertas = [x for x in etapas if x.abierto and x.slug != t.slug]
-    modo = modo_push(epica) if t.epica else ""
-    ultima = bool(t.epica) and not abiertas
-    # `al-final`: la intermedia no se pushea; la ultima si, y su rama ya tiene
-    # la cadena entera, asi que el PR es uno solo contra el base del perfil.
-    diferido = modo == "al-final" and not ultima
+    # `al-final`: la intermedia no se pushea; la que cierra la cadena si, y su
+    # rama ya tiene la cadena entera: un solo PR contra el base del perfil.
+    plan = plan_de_push(t, ts)
+    diferido = plan.diferido
+    if plan.aviso:
+        console.print(f"[yellow]epica {t.epica}: {plan.aviso}.[/]")
     if pushear is None:
         pushear = not diferido
     elif diferido and pushear:
@@ -4360,15 +4470,16 @@ def close_cmd(slug: str, repo: str | None, pushear: bool | None,
                 "Cerrá con el arbol limpio: si no, lo que quede afuera no se pushea."
             )
         base = perfil(e.repo).get("base") or base_de(rp) or ""
-        intermedias: list[str] = []
-        if modo == "al-final" and ultima:
-            for x in etapas:
-                ex = x.entrada(e.repo)
-                if (x.slug != t.slug and ex and ex.rama and ex.rama != e.rama
-                        and existe_rama(rp, ex.rama)):
-                    intermedias.append(ex.rama)
-        else:
-            base = base_de_ticket(t, e.repo, rp, base, ts)
+        if not plan.push_final:
+            # Contra la etapa anterior solo si esta en el remoto: si no (un
+            # `--pushear` sobre una intermedia al-final), el compare seria un
+            # link muerto.
+            previa = base_de_ticket(t, rp, base, ts)
+            if previa != base and not en_remoto(rp, previa):
+                console.print(f"[dim]{e.repo}: '{previa}' no esta en el remoto: el "
+                              f"compare va contra {base}.[/]")
+            else:
+                base = previa
         if diferido:
             console.print(f"[dim]{e.repo}: push diferido: '{e.rama}' se pushea con la "
                           f"ultima etapa de la epica {t.epica}.[/]")
@@ -4388,14 +4499,22 @@ def close_cmd(slug: str, repo: str | None, pushear: bool | None,
         elif e.rama:
             # Sin push no hay nada que comparar todavia: la rama no esta en el
             # remoto. `pusheada` queda en False y el primer paso manual es el push.
-            pusheada = bool(git(rp, "rev-parse", "--verify", "--quiet",
-                                f"refs/remotes/origin/{e.rama}"))
+            pusheada = en_remoto(rp, e.rama)
         if limpiar_worktree and e.cwd and Path(e.cwd) != rp and Path(e.cwd).exists():
             _quitar_worktree(rp, Path(e.cwd))
             trabajo = rp
+        contenidas = []
+        if plan.push_final and pusheada:
+            contenidas = [r for r, _rp in _ramas_de_etapas(plan.etapas, t, e.repo)
+                          if r != e.rama and _es_ancestro(rp, r, e.rama)]
         if (pasos := _pasos_manuales(t.slug, rp, trabajo, e, base, pusheada,
-                                     intermedias)):
+                                     contenidas)):
             urls.append((e.repo, pasos))
+
+    # `al-final` confia en que la rama final contiene la cadena entera. No es
+    # asi si las etapas se cerraron fuera de orden, o si una vive en otro repo:
+    # ese trabajo no llego al remoto, y nadie lo va a notar si no se dice aca.
+    huerfanas = _etapas_sin_respaldo(plan, t) if plan.push_final else []
 
     # Archivar UNA vez. Al segundo `close` el cuerpo ya es el puntero al
     # historial, asi que re-archivar sobrescribe el historial con "el cuerpo
@@ -4426,13 +4545,19 @@ def close_cmd(slug: str, repo: str | None, pushear: bool | None,
                 # Los sub-pasos del borrado ya vienen indentados: no se numeran.
                 pref = f"  {n}. " if not paso.startswith("  ") else "     "
                 console.print(f"  {pref}{paso}")
-    if t.epica and ultima:
+    if huerfanas:
+        console.print(f"\n[red]{len(huerfanas)} ramas de etapas no quedaron en la rama "
+                      "pusheada[/] (etapas cerradas fuera de orden, o en otro repo). "
+                      "Hoy solo existen en este disco:")
+        for r, rp in huerfanas:
+            console.print(f"  git -C {rp} push -u origin {r}")
+    if t.epica and plan.cierra_cadena:
         console.print(f"\n[bold]epica {t.epica}[/]: era la ultima etapa abierta, la "
                       f"epica queda lista para cerrar: [bold]factoria close {t.epica}[/]")
     elif t.epica:
-        console.print(f"\n[dim]epica {t.epica}: quedan {len(abiertas)} etapas abiertas "
-                      f"({', '.join(x.slug for x in abiertas)}).[/]")
-    if (propias := [x for x in etapas_de(t.slug, ts) if x.abierto]):
+        console.print(f"\n[dim]epica {t.epica}: quedan {len(plan.abiertas)} etapas "
+                      f"abiertas ({', '.join(x.slug for x in plan.abiertas)}).[/]")
+    if (propias := [x for x in etapas_de(t.slug, ts)[0] if x.abierto]):
         # Avisa, no impide: factoria no bloquea en ningun lado menos `aprobar`.
         console.print(f"\n[yellow]{t.slug} es una epica con {len(propias)} etapas "
                       f"abiertas: {', '.join(x.slug for x in propias)}.[/]")
