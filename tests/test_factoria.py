@@ -545,6 +545,19 @@ def test_el_issue_espeja_los_entregables():
     assert "AuthService" in fx.cuerpo_issue(t)
 
 
+def test_cerrar_no_vacia_el_issue(monkeypatch, tmp_path):
+    """`close` deja el cuerpo en una linea y despues espeja: si el issue se
+    arma del cuerpo del ticket, todas las secciones quedan en _(vacío)_. Un
+    ticket cerrado se espeja desde el historial."""
+    monkeypatch.setattr(fx, "DATOS", tmp_path)
+    t = fx.Ticket(slug="x", cuerpo=("## Pedido crudo\n\nque el login no se caiga\n\n"
+                                    "## Entregables de código\n- `AuthService`\n"))
+    fx._archivar(t, tmp_path / "historial" / "x.md")
+    t.abierto = False
+    cuerpo = fx.cuerpo_issue(t)
+    assert "que el login no se caiga" in cuerpo and "AuthService" in cuerpo
+
+
 @pytest.mark.parametrize("cita,tema", [
     (r"C:\ariel\dfv\.contracts\ingesta.md", "ingesta"),
     ("C:/ariel/dfv/.contracts/ingesta.md", "ingesta"),
