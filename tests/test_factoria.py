@@ -545,6 +545,17 @@ def test_el_issue_espeja_los_entregables():
     assert "AuthService" in fx.cuerpo_issue(t)
 
 
+def test_cerrar_no_vacia_el_issue(monkeypatch, tmp_path):
+    """`close` deja el .md en un puntero y despues espeja: el issue tiene que
+    salir del historial, no del puntero."""
+    monkeypatch.setattr(fx, "DATOS", tmp_path)
+    t = fx.Ticket(slug="x", cuerpo=("## Criterios de aceptación\n"
+                                    "- [ ] login con `AuthService`\n"))
+    fx._archivar(t, tmp_path / "historial" / "x.md")
+    t.fase, t.abierto = "cerrado", False
+    assert "AuthService" in fx.cuerpo_issue(t)
+
+
 @pytest.mark.parametrize("cita,tema", [
     (r"C:\ariel\dfv\.contracts\ingesta.md", "ingesta"),
     ("C:/ariel/dfv/.contracts/ingesta.md", "ingesta"),

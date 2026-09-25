@@ -2817,10 +2817,16 @@ def cuerpo_issue(t: Ticket) -> str:
     ]
     for e in t.repos:
         partes.append(f"- `{e.repo}` ({e.cuenta}) — rama `{e.rama or '?'}`")
+    # Cerrado, el .md ya es el puntero que deja `close`: espejarlo tal cual
+    # vaciaria el issue justo al cerrarlo. El cuerpo real esta en el historial.
+    fuente = t.cuerpo
+    hist = DATOS / "historial" / f"{t.slug}.md"
+    if not t.abierto and hist.is_file():
+        fuente = hist.read_text(encoding="utf-8")
     for enc in ("## Pedido crudo", "## Criterios de aceptación",
                 "## Fuera de alcance", "## Entregables de código",
                 "## Supuestos abiertos"):
-        cuerpo = _seccion(t.cuerpo, enc)
+        cuerpo = _seccion(fuente, enc)
         partes += ["", enc.replace("## ", "### "), "", cuerpo or "_(vacío)_"]
     return "\n".join(partes)
 
