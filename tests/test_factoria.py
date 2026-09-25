@@ -1101,3 +1101,59 @@ def test_board_no_marca_como_riesgo_una_rama_con_push_diferido():
     h = "\n".join(fx.hallazgos(rel))
     assert "1 ramas solo existen en este disco" in h
     assert "push diferido" in h and "feature/etapa1" in h
+
+
+# --------------------------------------------------------------------------
+# new con worktree: el checkout principal no se mueve
+# --------------------------------------------------------------------------
+
+def test_new_con_worktree_no_mueve_el_checkout_principal(cadena, monkeypatch, tmp_path):
+    """`new` ignoraba `worktree: true` del perfil: hacia checkout -b en el
+    checkout principal y lanzaba la sesion ahi, fuera de todo worktree."""
+    raiz = tmp_path / "wt"
+    monkeypatch.setattr(fx, "perfil", lambda n: {"base": "master", "cuenta": "dfv",
+                                                 "worktree": True,
+                                                 "worktree_raiz": str(raiz)})
+    r = CliRunner().invoke(fx.cli, ["new", "otro", "--pedido", "x", "--tipo", "chore",
+                                    "--no-lanzar"])
+    assert r.exit_code == 0, r.output
+    assert _g(cadena.repo, "rev-parse", "--abbrev-ref", "HEAD") == "master"
+    destino = raiz / "otro"
+    assert _g(destino, "rev-parse", "--abbrev-ref", "HEAD") == "chore/otro"
+    e = fx.buscar_ticket("otro").repos[0]
+    assert (e.rama, e.cwd) == ("chore/otro", str(destino))
+
+
+def test_new_aqui_no_arma_worktree(cadena, monkeypatch, tmp_path):
+    raiz = tmp_path / "wt"
+    monkeypatch.setattr(fx, "perfil", lambda n: {"base": "master", "cuenta": "dfv",
+                                                 "worktree": True,
+                                                 "worktree_raiz": str(raiz)})
+    r = CliRunner().invoke(fx.cli, ["new", "aca", "--pedido", "x", "--aqui", "--no-lanzar"])
+    assert r.exit_code == 0, r.output
+    assert not (raiz / "aca").exists()
+    assert fx.buscar_ticket("aca").repos[0].cwd == str(cadena.repo)
+
+
+def test_resolver_rama_avisa_los_skip_worktree_que_el_checkout_pisaria(cadena):
+    """`git status --porcelain` no ve los skip-worktree: el chequeo de sucio los
+    dejaba pasar y el checkout moria con el error crudo de git."""
+    _commit(cadena.repo, "env.txt", "master")
+    cadena.rama("feature/base", "master", "otro.txt")
+    _g(cadena.repo, "checkout", "-q", "feature/base")
+    _commit(cadena.repo, "env.txt", "cambia en la base")
+    _g(cadena.repo, "checkout", "-q", "master")
+    (cadena.repo / "env.txt").write_text("local", encoding="utf-8")
+    _g(cadena.repo, "update-index", "--skip-worktree", "env.txt")
+    with pytest.raises(fx.click.ClickException) as err:
+        fx._resolver_rama(cadena.repo, "feature/base", "master", None, "x", "chore", False)
+    assert "skip-worktree" in err.value.message and "env.txt" in err.value.message
+    assert _g(cadena.repo, "rev-parse", "--abbrev-ref", "HEAD") == "master"
+
+
+def test_resolver_rama_deja_pasar_skip_worktree_que_no_cambia(cadena):
+    _commit(cadena.repo, "env.txt", "igual")
+    (cadena.repo / "env.txt").write_text("local", encoding="utf-8")
+    _g(cadena.repo, "update-index", "--skip-worktree", "env.txt")
+    rama = fx._resolver_rama(cadena.repo, "master", "master", None, "y", "chore", False)
+    assert rama == "chore/y"
