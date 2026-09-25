@@ -65,7 +65,9 @@ Los comandos, en el orden en que se usan:
 | 8 | `close <slug>` | archiva el cuerpo e imprime **los pasos que faltan a mano**, en orden. `--sin-pushear` para cerrar sin tocar el remoto |
 
 Flags de `new` que importan: `--aqui` (no crear rama, usar la actual),
-`--pedido "…"` (en vez de abrir el editor), `--no-lanzar`, `--tipo fix|chore`.
+`--pedido "…"` (en vez de abrir el editor), `--no-lanzar`, `--tipo fix|chore`, y
+los de épica — `--epica`, `--continua`, `--push-etapas` — que tienen
+[su sección](#épicas-etapas-encadenadas).
 
 ### Qué se declara en `plan`
 
@@ -107,8 +109,9 @@ spec-drift rojo convertiría el gate en ruido.
 
 ### Cerrar sin pushear
 
-`close` pushea por defecto. Con `--sin-pushear` no toca el remoto y el push pasa
-a ser el primer paso de la lista que imprime:
+`close` pushea por defecto — salvo una etapa intermedia de una épica
+`al-final`, ver abajo. Con `--sin-pushear` no toca el remoto y el push pasa a
+ser el primer paso de la lista que imprime:
 
 ```
 Falta a mano, en este orden:
@@ -130,6 +133,41 @@ con `-D`.
 Si la rama registrada es la base (pasa con `new --aqui`) o está en
 `ramas_prohibidas`, **no propone borrarla**. Y cerrar dos veces no re-archiva:
 el historial no se pisa.
+
+### Épicas: etapas encadenadas
+
+Una épica es **un ticket común que hace de paraguas**; no hay objeto nuevo. Sus
+etapas son tickets que la nombran, cada una con su rama encadenada a la de la
+anterior:
+
+```bash
+factoria new rediseno --push-etapas al-final --pedido "…" --no-lanzar   # la épica
+factoria new etapa-1 --epica rediseno --pedido "…" --no-lanzar          # desde el base:
+factoria new etapa-2 --continua etapa-1 --pedido "…" --no-lanzar        # desde feature/etapa-1
+```
+
+`--continua` hereda la épica de la etapa anterior y hace nacer la rama de la de
+ella. Queda en el front matter como `epica:` y `continua_a:` — el puntero va
+**hacia atrás**, porque cuando nace la etapa N la N+1 no existe.
+
+`push_etapas:`, en la épica, decide cuándo se pushea:
+
+| Modo | Etapa intermedia | La que cierra la cadena |
+|---|---|---|
+| `al-final` *(default)* | no pushea, ni imprime compare | pushea su rama —que ya contiene toda la cadena— y **un** compare contra el `base:` |
+| `por-etapa` | pushea, compare contra la rama de la anterior | igual |
+
+Un `--pushear` o `--sin-pushear` explícito le gana al modo. En `al-final`, al
+cerrar la cadena `close` verifica que las ramas de las otras etapas estén
+contenidas en la que pushea: si alguna no lo está —se cerraron fuera de orden,
+o vive en otro repo— lo dice en rojo con el push que falta.
+
+`board` y `tickets` listan las etapas **debajo de su épica, en orden de
+cadena**, y avisan si la cadena está rota. En `board`, una rama sin push de
+una épica `al-final` figura como `diferido`, no como riesgo — mientras a la
+cadena le quede una etapa abierta, o si ya quedó contenida en la rama pusheada.
+El grafo mide cada etapa contra la rama de la anterior, así `--que-toca` no le
+atribuye a la etapa 2 lo que hizo la 1.
 
 ## Volver a una tarea
 
@@ -256,7 +294,8 @@ matter del ticket:
 | `abierto: false` | issue cerrado |
 
 Los repos van como **label** y no como campo del Project porque un ticket cruza
-repos por naturaleza y un single-select no puede tener N valores.
+repos por naturaleza y un single-select no puede tener N valores. `epica`,
+`continua_a` y `push_etapas` no se espejan: el issue sigue plano.
 
 Sin red o sin `gh`, **todo comando sigue funcionando** y `board` avisa
 `espejo N tickets abiertos sin issue`. `factoria abrir <slug>` abre el issue en
