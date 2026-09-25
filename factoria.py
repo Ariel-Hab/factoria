@@ -2413,6 +2413,21 @@ def _git_o_falla(rp: Path, *args: str) -> None:
         )
 
 
+def _skip_worktree_que_cambian(rp: Path, hacia: str) -> list[str]:
+    """Los archivos con skip-worktree que un checkout a `hacia` tocaria.
+
+    `git status --porcelain` no los lista, asi que el chequeo de sucio los
+    dejaba pasar y el que cortaba era git, con un error crudo a mitad de camino.
+    """
+    if not hacia:
+        return []
+    ocultos = [l[2:] for l in git(rp, "ls-files", "-v").splitlines() if l.startswith("S ")]
+    if not ocultos:
+        return []
+    cambian = git(rp, "diff", "--name-only", "HEAD", hacia, "--", *ocultos)
+    return cambian.splitlines() if cambian else []
+
+
 def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None,
                    slug: str, tipo: str, aqui: bool) -> str:
     """La rama del ticket. Por defecto SIEMPRE una nueva, derivada del slug.
@@ -2432,6 +2447,14 @@ def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None,
             f"{rp.name} tiene cambios sin commitear: el checkout a '{destino}' los "
             f"arrastraria ahi.\nCommiteálos, guardálos con `git stash`, o usá --aqui "
             f"para quedarte en {actual}.\n\n" + sucio[:400]
+        )
+    ocultos = _skip_worktree_que_cambian(rp, destino if existe_rama(rp, destino) else base)
+    if ocultos:
+        raise click.ClickException(
+            f"{rp.name} tiene archivos con skip-worktree que cambian entre {actual} y "
+            f"'{destino}': `git status` no los muestra, pero el checkout los pisaria "
+            f"y git lo corta.\nUsá el worktree del perfil (--worktree), o sacales el "
+            f"flag y guardalos antes.\n\n" + "\n".join(ocultos)
         )
     if existe_rama(rp, destino):
         _git_o_falla(rp, "checkout", destino)
@@ -2459,6 +2482,8 @@ def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None,
               show_default=True, help="Prefijo de la rama.")
 @click.option("--aqui", is_flag=True,
               help="No crear rama: registrar la actual. Escape hatch explicito.")
+@click.option("--worktree/--sin-worktree", default=None,
+              help="Forzar o evitar el ritual de worktree del perfil.")
 @click.option("--no-lanzar", is_flag=True, help="Crear el ticket sin abrir la sesion.")
 @click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
 @click.option("--epica", help="Slug de la epica a la que pertenece esta etapa.")
@@ -2469,8 +2494,8 @@ def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None,
               help="Para el ticket que hace de epica: cuando se pushean sus etapas. "
                    "Sin esto, al-final.")
 def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
-        rama_pedida: str | None, tipo: str, aqui: bool, no_lanzar: bool,
-        forzar: bool, epica: str | None, continua: str | None,
+        rama_pedida: str | None, tipo: str, aqui: bool, worktree: bool | None,
+        no_lanzar: bool, forzar: bool, epica: str | None, continua: str | None,
         push_etapas: str | None) -> None:
     """Crea un ticket en fase plan y abre su sesion, con id conocido de antemano."""
     crudo, slug = slug, normalizar_slug(slug)
@@ -2538,13 +2563,26 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
                           f"etapa nace de {base or '(sin base)'}.[/]")
         base = desde
     actual = git(rp, "rev-parse", "--abbrev-ref", "HEAD") or ""
-    rama = _resolver_rama(rp, base, actual, rama_pedida, slug, tipo, aqui)
+    usar_wt = (pf.get("worktree", False) if worktree is None else worktree) and not aqui
+    if usar_wt:
+        # El checkout principal no se mueve: queda en la rama en que estaba y
+        # la sesion nace en el worktree, como en `open`.
+        if not base:
+            raise click.ClickException(
+                f"no puedo determinar la base de {rp.name} para el worktree. "
+                "Seteá `base:` en su perfil."
+            )
+        rama = rama_pedida or f"{tipo}/{slug}"
+        cwd = _ritual_worktree(rp, pf, rama, base)
+    else:
+        rama = _resolver_rama(rp, base, actual, rama_pedida, slug, tipo, aqui)
+        cwd = str(rp)
     doc = crear_doc(rp.name, slug)
     t = Ticket(
         slug=slug, fase="plan", tipo=tipo, abierto=True, spec_congelado="",
         epica=epica or "", continua_a=previo.slug if previo else "",
         push_etapas="" if epica else (push_etapas or ""),
-        repos=[RepoTicket(repo=rp.name, cuenta=cta, rama=rama, cwd=str(rp),
+        repos=[RepoTicket(repo=rp.name, cuenta=cta, rama=rama, cwd=cwd,
                           session_id=sid, doc=str(doc),
                           sesiones=[SesionTicket(sid, cta, hoy())])],
         cuerpo=CUERPO_TICKET.format(slug=slug, pedido=pedido.strip()),
@@ -2560,6 +2598,8 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     console.print(f"  doc      {doc}")
     console.print(f"  sesion   {sid}")
     console.print(f"  rama     {rama or '(sin rama)'}")
+    if cwd != str(rp):
+        console.print(f"  cwd      {cwd}")
     if epica:
         console.print(f"  epica    {epica}"
                       + (f"  (continua a {previo.slug})" if previo else ""))
@@ -2572,7 +2612,7 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     if no_lanzar:
         console.print(f"[dim]Para abrirla: factoria resume {slug}[/]")
         return
-    _lanzar_en(cta, str(rp), ["--session-id", sid], forzar, False, rama)
+    _lanzar_en(cta, cwd, ["--session-id", sid], forzar, False, rama)
 
 
 # --- Skills de mattpocock: cuales se usan, y por que las otras no ------------
