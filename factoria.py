@@ -3177,6 +3177,14 @@ def trello_api(metodo: str, ruta: str, **params: str) -> tuple[int, str]:
         return 0, str(e)
 
 
+def mi_id_trello() -> str:
+    """El id del usuario dueño del token: el miembro de las tarjetas que se crean."""
+    rc, out = trello_api("GET", "/members/me", fields="id")
+    if rc != 200:
+        raise click.ClickException(f"Trello respondio {rc}: {out}")
+    return json.loads(out)["id"]
+
+
 def config_trello() -> dict:
     """`tablero:` (id o shortlink) y `listas:` {fase: nombre de lista} del
     .factoria-trello.yml. Sin `listas` no se mueve nada."""
@@ -3246,12 +3254,13 @@ def trello_cmd(slug: str, tarjeta: str | None, texto: str | None,
             raise click.ClickException(f"ya tiene tarjeta: {t.trello}")
         cfg = config_trello()
         rc, out = trello_api("POST", "/cards", idList=lista_de_fase(cfg, t.fase),
-                             name=(titulo or t.slug).strip(), desc=(texto or "").strip())
+                             name=(titulo or t.slug).strip(), desc=(texto or "").strip(),
+                             idMembers=mi_id_trello())
         if rc != 200:
             raise click.ClickException(f"Trello respondio {rc}: {out}")
         t.trello = json.loads(out)["shortUrl"]
         escribir_ticket(t)
-        console.print(f"[green]tarjeta creada[/] en la lista de '{t.fase}': {t.trello}")
+        console.print(f"[green]tarjeta creada[/] en la lista de '{t.fase}', con vos como miembro: {t.trello}")
         return
     if mover:
         if not (m := RE_TARJETA.search(t.trello)):
