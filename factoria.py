@@ -1568,6 +1568,9 @@ class Ticket:
     epica: str = ""
     continua_a: str = ""
     push_etapas: str = ""
+    # URL de la tarjeta de Trello donde se informa el estado. Solo vinculo:
+    # nada se lee de alli y nada se escribe sin `trello --publicar`.
+    trello: str = ""
     repos: list[RepoTicket] = field(default_factory=list)
     cuerpo: str = ""
     path: Path | None = None
@@ -1588,7 +1591,7 @@ class Ticket:
             "proyecto_item": self.proyecto_item,
             # Solo si tienen valor: emitirlos vacios reescribiria todos los tickets
             # que no son de ninguna epica en el proximo `board`, sin cambiar nada.
-            **{k: v for k in ("epica", "continua_a", "push_etapas")
+            **{k: v for k in ("epica", "continua_a", "push_etapas", "trello")
                if (v := getattr(self, k))},
             # Derivada de `repos`, duplicada a proposito: Obsidian no agrupa ni
             # busca por una lista de diccionarios. Esta es la que leen las vistas
@@ -1666,6 +1669,7 @@ def leer_ticket(p: Path) -> Ticket | None:
         epica=str(fm.get("epica") or ""),
         continua_a=str(fm.get("continua_a") or ""),
         push_etapas=str(fm.get("push_etapas") or ""),
+        trello=str(fm.get("trello") or ""),
         repos=repos,
         cuerpo=txt[m.end():],
         path=p,
@@ -2984,6 +2988,19 @@ def espejar_si_se_puede(t: Ticket) -> None:
     escribir_ticket(t)
     for h in hechos:
         console.print(f"  {h}")
+    avisar_trello(t)
+
+
+def avisar_trello(t: Ticket) -> None:
+    """Si el perfil de algun repo declara `espejos: [trello]`, deja una linea
+    que la skill `factoria` lee como la orden de preguntar. Es solo un aviso:
+    factoria no decide por el usuario ni escribe en Trello."""
+    if t.trello or not any("trello" in (perfil(e.repo).get("espejos") or ())
+                           for e in t.repos):
+        return
+    console.print(f"  [magenta]trello:[/] este repo espeja a Trello. Preguntale al "
+                  f"usuario si quiere una descripcion corta (skill `trello`, "
+                  f"`factoria trello {t.slug}`).")
 
 
 def espejar(t: Ticket, cfg: dict) -> list[str]:
@@ -3107,6 +3124,186 @@ def abrir_cmd(slug: str) -> None:
         os.startfile(t.issue_url)  # type: ignore[attr-defined]
     except (AttributeError, OSError) as exc:
         console.print(f"[dim]no pude abrir el navegador ({exc}); la URL esta arriba.[/]")
+
+
+# --------------------------------------------------------------------------
+# Trello: un comentario corto de estado por ticket
+#
+# El ticket .md sigue siendo canonico; la tarjeta solo recibe, a pedido, un
+# parrafo para que el equipo sepa en que anda uno. `trello <slug>` junta los
+# hechos (solo lectura); redactarlos es juicio y lo hace la skill `trello`.
+# Credenciales: TRELLO_KEY y TRELLO_TOKEN, o .factoria-trello.yml en este repo
+# (gitignoreado) o en ~. Nunca en el repo de datos: ese se pushea.
+# --------------------------------------------------------------------------
+
+RE_TARJETA = re.compile(r"trello\.com/c/([A-Za-z0-9]+)")
+TRELLO_MAX = 600
+
+
+def archivo_trello() -> Path:
+    """El `.factoria-trello.yml` del repo de codigo (gitignoreado) si existe;
+    si no, el de la carpeta del usuario."""
+    local = Path(__file__).resolve().parent / ".factoria-trello.yml"
+    return local if local.is_file() else Path.home() / ".factoria-trello.yml"
+
+
+def credenciales_trello() -> tuple[str, str]:
+    key, tok = os.environ.get("TRELLO_KEY", ""), os.environ.get("TRELLO_TOKEN", "")
+    p = archivo_trello()
+    if not (key and tok) and p.is_file():
+        try:
+            d = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            key, tok = key or str(d.get("key", "")), tok or str(d.get("token", ""))
+        except (OSError, yaml.YAMLError):
+            pass
+    return key, tok
+
+
+def trello_api(metodo: str, ruta: str, **params: str) -> tuple[int, str]:
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    key, tok = credenciales_trello()
+    if not (key and tok):
+        return 0, "faltan TRELLO_KEY / TRELLO_TOKEN (o .factoria-trello.yml)"
+    q = urllib.parse.urlencode({**params, "key": key, "token": tok})
+    req = urllib.request.Request(f"https://api.trello.com/1{ruta}?{q}", method=metodo)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")[:200]
+    except (urllib.error.URLError, OSError) as e:
+        return 0, str(e)
+
+
+def config_trello() -> dict:
+    """`tablero:` (id o shortlink) y `listas:` {fase: nombre de lista} del
+    .factoria-trello.yml. Sin `listas` no se mueve nada."""
+    p = archivo_trello()
+    try:
+        d = yaml.safe_load(p.read_text(encoding="utf-8")) if p.is_file() else {}
+        return {str(k).lower(): v for k, v in d.items()} if isinstance(d, dict) else {}
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+def lista_de_fase(cfg: dict, fase: str) -> str:
+    """El id de la lista del tablero que corresponde a la fase, por nombre."""
+    nombre = (cfg.get("listas") or {}).get(fase)
+    if not nombre:
+        raise click.ClickException(
+            f"`listas:` de .factoria-trello.yml no tiene la fase '{fase}'.")
+    if not cfg.get("tablero"):
+        raise click.ClickException("falta `tablero:` en .factoria-trello.yml.")
+    rc, out = trello_api("GET", f"/boards/{cfg['tablero']}/lists", fields="name")
+    if rc != 200:
+        raise click.ClickException(f"Trello respondio {rc}: {out}")
+    listas = {l["name"].strip().lower(): l["id"] for l in json.loads(out)}
+    if str(nombre).strip().lower() not in listas:
+        raise click.ClickException(
+            f"el tablero no tiene la lista '{nombre}' (tiene: {', '.join(listas)}).")
+    return listas[str(nombre).strip().lower()]
+
+
+def hechos_para_trello(t: Ticket) -> str:
+    """Lo que hay en disco sobre el ticket, para redactar el estado."""
+    partes = [f"ticket: {t.slug}  (fase: {t.fase}, tipo: {t.tipo}, "
+              f"{'abierto' if t.abierto else 'cerrado'})"]
+    if t.epica:
+        partes.append(f"epica: {t.epica}")
+    for titulo in ("## Pedido crudo", "## Criterios de aceptación", "## Fuera de alcance"):
+        if txt := _seccion(t.cuerpo, titulo):
+            partes += ["", titulo, txt]
+    for e in t.repos:
+        if e.doc and Path(e.doc).is_file():
+            est = _seccion(Path(e.doc).read_text(encoding="utf-8", errors="replace"),
+                           "## Estado actual")
+            if est:
+                partes += ["", f"## Estado actual ({e.repo})", est]
+        if e.cwd and Path(e.cwd).is_dir() and e.rama:
+            r = subprocess.run(["git", "-C", e.cwd, "log", "--oneline", "-n", "15",
+                                f"{e.rama}", "--not", "--remotes"],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace")
+            if r.returncode == 0 and r.stdout.strip():
+                partes += ["", f"## Commits sin pushear ({e.repo}, {e.rama})",
+                           r.stdout.strip()]
+    return "\n".join(partes)
+
+
+@cli.command("trello")
+@click.argument("slug")
+@click.option("--tarjeta", help="URL de la tarjeta de Trello: la vincula al ticket.")
+@click.option("--texto", help="El estado ya redactado (lo escribe la skill `trello`).")
+@click.option("--publicar", is_flag=True,
+              help="Con --texto: lo postea como comentario en la tarjeta.")
+@click.option("--probar", is_flag=True, help="Diagnostico: credenciales y tarjeta, sin escribir.")
+@click.option("--crear", is_flag=True,
+              help="Crea la tarjeta del ticket en la lista de su fase y la vincula.")
+@click.option("--mover", is_flag=True,
+              help="Mueve la tarjeta vinculada a la lista de la fase actual del ticket.")
+def trello_cmd(slug: str, tarjeta: str | None, texto: str | None,
+               publicar: bool, probar: bool, crear: bool, mover: bool) -> None:
+    """Vincula el ticket con su tarjeta de Trello, la mueve y publica un estado corto.
+
+    Solo toca la tarjeta que el ticket tiene vinculada; no lee ni mueve otras.
+    """
+    t = buscar_ticket(slug)
+    if crear:
+        if t.trello:
+            raise click.ClickException(f"ya tiene tarjeta: {t.trello}")
+        cfg = config_trello()
+        rc, out = trello_api("POST", "/cards", idList=lista_de_fase(cfg, t.fase),
+                             name=t.slug, desc=(texto or "").strip())
+        if rc != 200:
+            raise click.ClickException(f"Trello respondio {rc}: {out}")
+        t.trello = json.loads(out)["shortUrl"]
+        escribir_ticket(t)
+        console.print(f"[green]tarjeta creada[/] en la lista de '{t.fase}': {t.trello}")
+        return
+    if mover:
+        if not (m := RE_TARJETA.search(t.trello)):
+            raise click.ClickException(f"sin tarjeta: `factoria trello {t.slug} --tarjeta <url>`.")
+        rc, out = trello_api("PUT", f"/cards/{m.group(1)}",
+                             idList=lista_de_fase(config_trello(), t.fase))
+        if rc != 200:
+            raise click.ClickException(f"Trello respondio {rc}: {out}")
+        console.print(f"[green]{t.slug}[/] movida a la lista de '{t.fase}'.")
+        return
+    if tarjeta:
+        if not RE_TARJETA.search(tarjeta):
+            raise click.ClickException("la URL no parece de una tarjeta (trello.com/c/<id>/...).")
+        t.trello = tarjeta.strip()
+        escribir_ticket(t)
+        console.print(f"[green]{t.slug}[/] vinculado a {t.trello}")
+        return
+    m = RE_TARJETA.search(t.trello)
+    if probar:
+        console.print(f"  credenciales  {'ok' if all(credenciales_trello()) else '[red]faltan[/]'}")
+        console.print(f"  tarjeta       {t.trello or '[red]sin vincular[/]'}")
+        if m:
+            rc, out = trello_api("GET", f"/cards/{m.group(1)}", fields="name")
+            console.print(f"  lectura       {'ok ' + out[:80] if rc == 200 else '[red]' + out + '[/]'}")
+        return
+    if texto is None:
+        click.echo(hechos_para_trello(t))
+        return
+    texto = texto.strip()
+    if len(texto) > TRELLO_MAX:
+        raise click.ClickException(
+            f"el estado tiene {len(texto)} caracteres (max {TRELLO_MAX}): acortalo.")
+    console.print(f"[bold]{t.slug}[/]  ->  {t.trello or '[red]sin tarjeta[/]'}\n")
+    click.echo(texto)
+    if not publicar:
+        console.print("\n[dim]borrador: agregá --publicar para comentarlo en la tarjeta.[/]")
+        return
+    if not m:
+        raise click.ClickException(f"sin tarjeta: `factoria trello {t.slug} --tarjeta <url>`.")
+    rc, out = trello_api("POST", f"/cards/{m.group(1)}/actions/comments", text=texto)
+    if rc != 200:
+        raise click.ClickException(f"Trello respondio {rc}: {out}")
+    console.print("\n[green]comentario publicado.[/]")
 
 
 def _desempatar_por_nombre_exacto(entradas: list, repo: str | None) -> list:

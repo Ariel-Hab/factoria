@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# credenciales de Trello (key/token): nunca al remoto
+.factoria-trello.yml
