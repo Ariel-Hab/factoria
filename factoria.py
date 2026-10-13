@@ -3207,45 +3207,35 @@ def lista_de_fase(cfg: dict, fase: str) -> str:
 
 
 def hechos_para_trello(t: Ticket) -> str:
-    """Lo que hay en disco sobre el ticket, para redactar el estado."""
-    partes = [f"ticket: {t.slug}  (fase: {t.fase}, tipo: {t.tipo}, "
-              f"{'abierto' if t.abierto else 'cerrado'})"]
+    """Lo que el ticket pide, para describirlo. Sin estado ni commits: eso lo
+    muestra el kanban."""
+    partes = [f"ticket: {t.slug}  (tipo: {t.tipo})"]
     if t.epica:
         partes.append(f"epica: {t.epica}")
-    for titulo in ("## Pedido crudo", "## Criterios de aceptación", "## Fuera de alcance"):
+    for titulo in ("## Pedido crudo", "## Criterios de aceptación", "## Fuera de alcance",
+                   "## Entregables de código"):
         if txt := _seccion(t.cuerpo, titulo):
             partes += ["", titulo, txt]
-    for e in t.repos:
-        if e.doc and Path(e.doc).is_file():
-            est = _seccion(Path(e.doc).read_text(encoding="utf-8", errors="replace"),
-                           "## Estado actual")
-            if est:
-                partes += ["", f"## Estado actual ({e.repo})", est]
-        if e.cwd and Path(e.cwd).is_dir() and e.rama:
-            r = subprocess.run(["git", "-C", e.cwd, "log", "--oneline", "-n", "15",
-                                f"{e.rama}", "--not", "--remotes"],
-                               capture_output=True, text=True, encoding="utf-8",
-                               errors="replace")
-            if r.returncode == 0 and r.stdout.strip():
-                partes += ["", f"## Commits sin pushear ({e.repo}, {e.rama})",
-                           r.stdout.strip()]
     return "\n".join(partes)
 
 
 @cli.command("trello")
 @click.argument("slug")
 @click.option("--tarjeta", help="URL de la tarjeta de Trello: la vincula al ticket.")
-@click.option("--texto", help="El estado ya redactado (lo escribe la skill `trello`).")
+@click.option("--texto", help="La descripcion ya redactada (la escribe la skill `trello`).")
 @click.option("--publicar", is_flag=True,
-              help="Con --texto: lo postea como comentario en la tarjeta.")
+              help="Con --texto: la escribe como descripcion de la tarjeta.")
+@click.option("--reemplazar", is_flag=True,
+              help="Con --publicar: pisa una descripcion que la tarjeta ya tenia.")
 @click.option("--probar", is_flag=True, help="Diagnostico: credenciales y tarjeta, sin escribir.")
 @click.option("--crear", is_flag=True,
               help="Crea la tarjeta del ticket en la lista de su fase y la vincula.")
 @click.option("--mover", is_flag=True,
               help="Mueve la tarjeta vinculada a la lista de la fase actual del ticket.")
 def trello_cmd(slug: str, tarjeta: str | None, texto: str | None,
-               publicar: bool, probar: bool, crear: bool, mover: bool) -> None:
-    """Vincula el ticket con su tarjeta de Trello, la mueve y publica un estado corto.
+               publicar: bool, probar: bool, crear: bool, mover: bool,
+               reemplazar: bool) -> None:
+    """Vincula el ticket con su tarjeta de Trello, la mueve y le pone una descripcion corta.
 
     Solo toca la tarjeta que el ticket tiene vinculada; no lee ni mueve otras.
     """
@@ -3292,18 +3282,25 @@ def trello_cmd(slug: str, tarjeta: str | None, texto: str | None,
     texto = texto.strip()
     if len(texto) > TRELLO_MAX:
         raise click.ClickException(
-            f"el estado tiene {len(texto)} caracteres (max {TRELLO_MAX}): acortalo.")
+            f"la descripcion tiene {len(texto)} caracteres (max {TRELLO_MAX}): acortala.")
     console.print(f"[bold]{t.slug}[/]  ->  {t.trello or '[red]sin tarjeta[/]'}\n")
     click.echo(texto)
     if not publicar:
-        console.print("\n[dim]borrador: agregá --publicar para comentarlo en la tarjeta.[/]")
+        console.print("\n[dim]borrador: agregá --publicar para escribirla en la tarjeta.[/]")
         return
     if not m:
         raise click.ClickException(f"sin tarjeta: `factoria trello {t.slug} --tarjeta <url>`.")
-    rc, out = trello_api("POST", f"/cards/{m.group(1)}/actions/comments", text=texto)
+    rc, out = trello_api("GET", f"/cards/{m.group(1)}", fields="desc")
     if rc != 200:
         raise click.ClickException(f"Trello respondio {rc}: {out}")
-    console.print("\n[green]comentario publicado.[/]")
+    previa = (json.loads(out).get("desc") or "").strip()
+    if previa and previa != texto and not reemplazar:
+        raise click.ClickException(
+            f"la tarjeta ya tiene descripcion, no la piso sin --reemplazar:\n{previa[:300]}")
+    rc, out = trello_api("PUT", f"/cards/{m.group(1)}", desc=texto)
+    if rc != 200:
+        raise click.ClickException(f"Trello respondio {rc}: {out}")
+    console.print("\n[green]descripcion escrita en la tarjeta.[/]")
 
 
 def _desempatar_por_nombre_exacto(entradas: list, repo: str | None) -> list:
