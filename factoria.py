@@ -3230,11 +3230,12 @@ def hechos_para_trello(t: Ticket) -> str:
 @click.option("--probar", is_flag=True, help="Diagnostico: credenciales y tarjeta, sin escribir.")
 @click.option("--crear", is_flag=True,
               help="Crea la tarjeta del ticket en la lista de su fase y la vincula.")
+@click.option("--titulo", help="Con --crear: titulo de la tarjeta (por defecto, el slug).")
 @click.option("--mover", is_flag=True,
               help="Mueve la tarjeta vinculada a la lista de la fase actual del ticket.")
 def trello_cmd(slug: str, tarjeta: str | None, texto: str | None,
                publicar: bool, probar: bool, crear: bool, mover: bool,
-               reemplazar: bool) -> None:
+               reemplazar: bool, titulo: str | None) -> None:
     """Vincula el ticket con su tarjeta de Trello, la mueve y le pone una descripcion corta.
 
     Solo toca la tarjeta que el ticket tiene vinculada; no lee ni mueve otras.
@@ -3245,7 +3246,7 @@ def trello_cmd(slug: str, tarjeta: str | None, texto: str | None,
             raise click.ClickException(f"ya tiene tarjeta: {t.trello}")
         cfg = config_trello()
         rc, out = trello_api("POST", "/cards", idList=lista_de_fase(cfg, t.fase),
-                             name=t.slug, desc=(texto or "").strip())
+                             name=(titulo or t.slug).strip(), desc=(texto or "").strip())
         if rc != 200:
             raise click.ClickException(f"Trello respondio {rc}: {out}")
         t.trello = json.loads(out)["shortUrl"]
