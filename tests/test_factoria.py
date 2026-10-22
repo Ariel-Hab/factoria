@@ -1157,3 +1157,121 @@ def test_resolver_rama_deja_pasar_skip_worktree_que_no_cambia(cadena):
     _g(cadena.repo, "update-index", "--skip-worktree", "env.txt")
     rama = fx._resolver_rama(cadena.repo, "master", "master", None, "y", "chore", False)
     assert rama == "chore/y"
+
+
+# --------------------------------------------------------------------------
+# trello_guard: escribir en Trello lo aprueba el usuario
+# --------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+
+def _guard():
+    spec = importlib.util.spec_from_file_location("trello_guard",
+                                                  RAIZ / "hooks" / "trello_guard.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+guard = _guard()
+
+
+def _bash(cmd, tool="Bash"):
+    return {"tool_name": tool, "tool_input": {"command": cmd}}
+
+
+@pytest.mark.parametrize("evento", [
+    _bash('factoria trello x --texto "hola" --publicar'),
+    _bash("factoria trello x --crear --titulo y"),
+    _bash("cd /c/ariel && factoria trello x --mover"),
+    _bash('python C:/ariel/integhra/factoria/factoria.py trello x --texto "a" --publicar '
+          '--reemplazar'),
+    _bash("factoria trello x --publicar --texto hola", tool="PowerShell"),
+    _bash("curl -X PUT https://api.trello.com/1/cards/abc?desc=x"),
+    _bash("cat C:/ariel/integhra/factoria/.factoria-trello.yml"),
+    _bash("echo $TRELLO_TOKEN"),
+    _bash("python -c 'import factoria; factoria.trello_api(\"PUT\", \"/cards/x\")'"),
+    {"tool_name": "Read", "tool_input": {"file_path": r"C:\ariel\integhra\factoria\.factoria-trello.yml"}},
+    {"tool_name": "Write", "tool_input": {"file_path": "x.py",
+                                          "content": "requests.put('https://api.trello.com/1')"}},
+    {"tool_name": "Edit", "tool_input": {"file_path": r"C:\ariel\integhra\factoria\hooks\trello_guard.py",
+                                         "old_string": "a", "new_string": "b"}},
+    {"tool_name": "Edit", "tool_input": {"file_path": r"C:\Users\U\.claude-dfv\settings.json",
+                                         "old_string": "a", "new_string": "b"}},
+    _bash("rm C:/ariel/integhra/factoria/hooks/trello_guard.py"),
+])
+def test_escribir_en_trello_o_tocar_el_token_pide_aprobacion(evento):
+    assert guard.decidir_pre(evento)
+
+
+@pytest.mark.parametrize("evento", [
+    _bash("factoria trello x"),
+    _bash('factoria trello x --texto "Mover el indicador debajo de los selectores"'),
+    _bash("factoria trello x --probar"),
+    _bash("factoria trello x --tarjeta https://trello.com/c/abc/1-x"),
+    _bash("factoria tickets && git status"),
+    {"tool_name": "Read", "tool_input": {"file_path": r"C:\ariel\.factoria\tickets\x.md"}},
+    {"tool_name": "Edit", "tool_input": {"file_path": r"C:\ariel\dfv\defeve\README.md",
+                                         "old_string": "a", "new_string": "b"}},
+])
+def test_leer_y_redactar_no_pide_nada(evento):
+    assert guard.decidir_pre(evento) == ""
+
+
+def test_el_hook_responde_ask_en_el_formato_de_claude_code(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(
+        json.dumps(_bash("factoria trello x --crear"))))
+    assert guard.main("pre") == 0
+    salida = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert (salida["hookEventName"], salida["permissionDecision"]) == ("PreToolUse", "ask")
+
+
+def test_sin_motivo_el_hook_no_imprime_nada(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(json.dumps(_bash("ls"))))
+    guard.main("pre")
+    assert capsys.readouterr().out == ""
+
+
+def test_despues_de_new_en_un_repo_con_trello_ordena_preguntar(cadena, monkeypatch):
+    monkeypatch.setattr(fx, "perfil", lambda n: {"base": "master", "cuenta": "dfv",
+                                                 "espejos": ["trello"]})
+    monkeypatch.setattr(fx.console, "width", 60)      # obliga a rich a partir lineas
+    monkeypatch.setattr(fx, "espejar_si_se_puede", fx.avisar_trello)   # sin GitHub
+    r = CliRunner().invoke(fx.cli, ["new", "tarjeta-nueva", "--pedido", "x", "--no-lanzar"])
+    assert r.exit_code == 0, r.output
+    evento = {"tool_name": "Bash",
+              "tool_input": {"command": 'factoria new tarjeta-nueva --pedido "x" --no-lanzar'},
+              "tool_response": {"stdout": r.output, "stderr": "", "interrupted": False}}
+    orden = guard.decidir_post(evento)
+    assert "OBLIGATORIO" in orden and "tarjeta-nueva" in orden and "AskUserQuestion" in orden
+
+
+def test_sin_trello_o_con_tarjeta_no_ordena_nada(cadena):
+    r = CliRunner().invoke(fx.cli, ["new", "sin-trello", "--pedido", "x", "--no-lanzar"])
+    evento = {"tool_name": "Bash", "tool_input": {"command": "factoria new sin-trello"},
+              "tool_response": {"stdout": r.output}}
+    assert guard.decidir_post(evento) == ""
+    otro = {"tool_name": "Bash", "tool_input": {"command": "factoria board"},
+            "tool_response": {"stdout": "este repo espeja a Trello"}}
+    assert guard.decidir_post(otro) == ""
+
+
+def test_el_motivo_muestra_lo_que_se_va_a_escribir():
+    motivo = guard.decidir_pre(_bash(
+        'factoria trello cartera --crear --titulo "Indicador" --texto "Mover el indicador."'))
+    assert "CREAR" in motivo and "cartera" in motivo
+    assert "Titulo: Indicador" in motivo and "Descripcion: Mover el indicador." in motivo
+    motivo = guard.decidir_pre(_bash('factoria trello cartera --texto "Otro." --publicar'))
+    assert "PUBLICAR" in motivo and "Descripcion: Otro." in motivo
+
+
+@pytest.mark.parametrize("evento", [
+    {"tool_name": "Edit", "tool_input": {"file_path": r"C:\ariel\.factoria\skills\factoria\SKILL.md",
+                                         "old_string": "a", "new_string": "el hook trello_guard"}},
+    {"tool_name": "Write", "tool_input": {"file_path": r"C:\ariel\README.md",
+                                          "content": "credenciales en .factoria-trello.yml"}},
+])
+def test_nombrar_el_hook_o_el_token_en_un_doc_no_pide_nada(evento):
+    """Falso positivo real: editar una skill que nombraba el hook pedia aprobacion."""
+    assert guard.decidir_pre(evento) == ""

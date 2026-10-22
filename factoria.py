@@ -2998,9 +2998,10 @@ def avisar_trello(t: Ticket) -> None:
     if t.trello or not any("trello" in (perfil(e.repo).get("espejos") or ())
                            for e in t.repos):
         return
+    # soft_wrap: sin cortes de linea, asi el hook PostToolUse lo encuentra entero.
     console.print(f"  [magenta]trello:[/] este repo espeja a Trello. Preguntale al "
-                  f"usuario si quiere una descripcion corta (skill `trello`, "
-                  f"`factoria trello {t.slug}`).")
+                  f"usuario si quiere crear la tarjeta (skill `trello`, "
+                  f"`factoria trello {t.slug}`).", soft_wrap=True)
 
 
 def espejar(t: Ticket, cfg: dict) -> list[str]:
