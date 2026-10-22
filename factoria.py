@@ -911,9 +911,9 @@ def board(docs: bool, ramas: bool, sesiones: bool, limite: int, como_json: bool)
             return (FASES.index(x.fase) if x.fase in FASES else 9,
                     _orden_tipo(x.tipo), x.slug)
         filas, avisos = orden_con_etapas(abiertos, clave, rel.tickets)
-        for tk, es_etapa in filas[:limite]:
+        for tk, prof in filas[:limite]:
             con_ses = sum(1 for e in tk.repos if e.session_id)
-            t.add_row(f"  └ {tk.slug}" if es_etapa else tk.slug, tk.fase, tk.tipo,
+            t.add_row(("  " if prof else "") + sangria(prof) + tk.slug, tk.fase, tk.tipo,
                       ", ".join(f"{e.repo}({e.cuenta})" for e in tk.repos) or "[red]-[/]",
                       f"{con_ses}/{len(tk.repos)}", str(tk.lineas))
         console.print(t)
@@ -1568,6 +1568,12 @@ class Ticket:
     epica: str = ""
     continua_a: str = ""
     push_etapas: str = ""
+    # Hitos: el nivel intermedio. Un hito es un ticket comun con `nivel: hito`
+    # que apunta a su epica con `epica`; sus etapas apuntan a el con `hito` (no
+    # con `epica`). La cadena de ramas y `push_etapas` viven en el hito, no en
+    # la epica: ver `dueno` y `padre`.
+    nivel: str = ""
+    hito: str = ""
     # URL de la tarjeta de Trello donde se informa el estado. Solo vinculo:
     # nada se lee de alli y nada se escribe sin `trello --publicar`.
     trello: str = ""
@@ -1578,6 +1584,29 @@ class Ticket:
     def entrada(self, repo: str) -> RepoTicket | None:
         r = repo.lower()
         return next((e for e in self.repos if e.repo.lower() == r), None)
+
+    @property
+    def es_hito(self) -> bool:
+        return self.nivel == NIVEL_HITO
+
+    @property
+    def dueno(self) -> str:
+        """El ticket duenio de la cadena de esta etapa: el hito, o la epica.
+
+        Un hito tambien tiene `epica`, pero no es una etapa: no se encadena ni
+        difiere el push con las de la epica.
+        """
+        return self.hito or ("" if self.es_hito else self.epica)
+
+    @property
+    def padre(self) -> str:
+        """Un nivel arriba en la jerarquia: el hito de la etapa, o la epica."""
+        return self.hito or self.epica
+
+    @property
+    def nombre_dueno(self) -> str:
+        """`hito X` o `epica X`, para los mensajes sobre la cadena."""
+        return f"hito {self.hito}" if self.hito else f"epica {self.epica}"
 
     def texto(self) -> str:
         fm = {
@@ -1591,7 +1620,8 @@ class Ticket:
             "proyecto_item": self.proyecto_item,
             # Solo si tienen valor: emitirlos vacios reescribiria todos los tickets
             # que no son de ninguna epica en el proximo `board`, sin cambiar nada.
-            **{k: v for k in ("epica", "continua_a", "push_etapas", "trello")
+            **{k: v for k in ("nivel", "epica", "hito", "continua_a", "push_etapas",
+                              "trello")
                if (v := getattr(self, k))},
             # Derivada de `repos`, duplicada a proposito: Obsidian no agrupa ni
             # busca por una lista de diccionarios. Esta es la que leen las vistas
@@ -1667,6 +1697,8 @@ def leer_ticket(p: Path) -> Ticket | None:
         issue_url=str(fm.get("issue_url") or ""),
         proyecto_item=str(fm.get("proyecto_item") or ""),
         epica=str(fm.get("epica") or ""),
+        nivel=str(fm.get("nivel") or ""),
+        hito=str(fm.get("hito") or ""),
         continua_a=str(fm.get("continua_a") or ""),
         push_etapas=str(fm.get("push_etapas") or ""),
         trello=str(fm.get("trello") or ""),
@@ -1718,6 +1750,9 @@ def buscar_ticket(slug: str) -> Ticket:
 # el `base:` del perfil. Es el default. `por-etapa`: cada etapa se pushea al
 # cerrarla, con el compare contra la rama de la anterior.
 AL_FINAL, POR_ETAPA = PUSH_ETAPAS = ("al-final", "por-etapa")
+# El unico valor de `nivel`. Sin el campo, un ticket es lo que era antes: una
+# epica si tiene etapas, una etapa si tiene `epica`, o un ticket suelto.
+NIVEL_HITO = "hito"
 
 
 def modo_push(epica: Ticket | None) -> str:
@@ -1758,10 +1793,14 @@ def ordenar_cadena(etapas: list[Ticket]) -> tuple[list[Ticket], str]:
     return orden, ""
 
 
-def etapas_de(epica: str, ts: list[Ticket]) -> tuple[list[Ticket], str]:
-    """Las etapas de una epica, abiertas y cerradas, en orden de cadena, y el
-    aviso si la cadena esta rota."""
-    return ordenar_cadena([t for t in ts if t.epica == epica])
+def etapas_de(dueno: str, ts: list[Ticket]) -> tuple[list[Ticket], str]:
+    """Las etapas de una epica o de un hito, abiertas y cerradas, en orden de
+    cadena, y el aviso si la cadena esta rota."""
+    return ordenar_cadena([t for t in ts if t.dueno == dueno])
+
+
+def hitos_de(epica: str, ts: list[Ticket]) -> list[Ticket]:
+    return [t for t in ts if t.es_hito and t.epica == epica and t.slug != epica]
 
 
 def rama_viva(t: Ticket | None, rp: Path, base_perfil: str) -> str:
@@ -1798,10 +1837,10 @@ def ramas_diferidas(ts: list[Ticket], repos: dict[str, Path]) -> set[tuple[str, 
     marcarlas en rojo en vez de disculparlas para siempre.
     """
     out: set[tuple[str, str]] = set()
-    for slug in {t.epica for t in ts if t.epica}:
+    for slug in {t.dueno for t in ts if t.dueno}:
         if modo_push(ticket_por_slug(ts, slug)) != AL_FINAL:
             continue
-        etapas = [t for t in ts if t.epica == slug]
+        etapas = [t for t in ts if t.dueno == slug]
         viva = any(t.abierto for t in etapas)
         for t in etapas:
             for e in t.repos:
@@ -1824,30 +1863,45 @@ def estado_push(r: Rama, diferidas: set[tuple[str, str]]) -> str:
 
 def orden_con_etapas(ts: list[Ticket], clave,
                      todos: list[Ticket] | None = None
-                     ) -> tuple[list[tuple[Ticket, bool]], list[str]]:
-    """(ticket, es_etapa) con cada epica seguida de sus etapas en orden de
-    cadena, y los avisos de las cadenas rotas.
+                     ) -> tuple[list[tuple[Ticket, int]], list[str]]:
+    """(ticket, profundidad) con cada epica seguida de sus hitos --cada uno con
+    sus etapas-- y de sus etapas directas en orden de cadena, y los avisos de
+    las cadenas rotas. Profundidad 0 es un ticket raiz.
 
-    El orden sale de la cadena completa (`todos`), no de las filas que se
-    muestran. Las etapas cuya epica no esta en la lista (cerrada, o de otro
-    filtro) quedan sueltas, ordenadas por `clave` como cualquier ticket.
+    El orden de las etapas sale de la cadena completa (`todos`), no de las filas
+    que se muestran; los hitos de una epica van por `clave`. Lo que cuelga de un
+    ticket que no esta en la lista (cerrado, o de otro filtro) queda suelto,
+    ordenado por `clave` como cualquier ticket.
     """
     todos = ts if todos is None else todos
     presentes = {id(t) for t in ts}
-    slugs = {t.slug for t in ts}
-    colgadas = {id(t) for t in ts if t.epica in slugs and t.epica != t.slug}
-    out: list[tuple[Ticket, bool]] = []
-    avisos: list[str] = []
     por_slug = {t.slug: t for t in ts}
-    for t in sorted((t for t in ts if id(t) not in colgadas), key=clave):
-        out.append((t, False))
+    colgadas = {id(t) for t in ts if t.padre in por_slug and t.padre != t.slug}
+    out: list[tuple[Ticket, int]] = []
+    avisos: list[str] = []
+
+    def bajar(t: Ticket, prof: int) -> None:
+        if any(x is t for x, _ in out):
+            return
+        out.append((t, prof))
+        if not t.es_hito:
+            for h in sorted(hitos_de(t.slug, ts), key=clave):
+                bajar(h, prof + 1)
         cadena, aviso = etapas_de(t.slug, todos)
         if aviso and cadena:
-            avisos.append(f"epica {t.slug}: {aviso}")
+            avisos.append(f"{'hito' if t.es_hito else 'epica'} {t.slug}: {aviso}")
         # `todos` puede traer otra instancia del mismo ticket: se muestra la de `ts`.
-        out += [(por_slug[x.slug], True) for x in cadena
-                if x.slug in por_slug and id(por_slug[x.slug]) in presentes]
+        out.extend((por_slug[x.slug], prof + 1) for x in cadena
+                   if x.slug in por_slug and id(por_slug[x.slug]) in presentes)
+
+    for t in sorted((t for t in ts if id(t) not in colgadas), key=clave):
+        bajar(t, 0)
     return out, avisos
+
+
+def sangria(prof: int) -> str:
+    """El prefijo de la fila de un listado jerarquico."""
+    return "  " * (prof - 1) + "└ " if prof else ""
 
 
 # --------------------------------------------------------------------------
@@ -2099,15 +2153,18 @@ def regenerar_indice() -> Path:
         "una sesion: para eso esta `factoria contexto <slug>`. Para mirarlo agrupado,",
         "[el mapa del vault](MAPA.md) y las vistas de `tickets.base`.",
         "",
-        "| slug | fase | tipo | repos | sesiones | issue |",
-        "|---|---|---|---|---|---|",
+        "| slug | fase | tipo | parte de | repos | sesiones | issue |",
+        "|---|---|---|---|---|---|---|",
     ]
     for t in sorted(ts, key=lambda x: (not x.abierto, x.slug)):
         repos = ", ".join(e.repo for e in t.repos) or "-"
         ses = sum(1 for e in t.repos if e.session_id)
         iss = f"[#{t.issue}]({t.issue_url})" if t.issue_url else "-"
+        padre = (f"{'epica' if t.es_hito else t.nombre_dueno.split()[0]} "
+                 f"[{t.padre}](tickets/{t.padre}.md)" if t.padre else "-")
         lineas.append(
-            f"| [{t.slug}](tickets/{t.slug}.md) | {t.fase} | {t.tipo} | {repos} | {ses} | {iss} |"
+            f"| [{t.slug}](tickets/{t.slug}.md) | {t.fase} | {t.tipo} | {padre} | {repos} "
+            f"| {ses} | {iss} |"
         )
     lineas.append("")
     p = DATOS / "INDICE.md"
@@ -2474,6 +2531,40 @@ def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None,
     return git(rp, "rev-parse", "--abbrev-ref", "HEAD") or destino
 
 
+def _resolver_jerarquia(epica: str | None, hito: str | None, nivel: str | None,
+                        previo: Ticket | None) -> tuple[str | None, str | None]:
+    """(epica, hito) del ticket nuevo, con los slugs ya resueltos.
+
+    Una etapa cuelga de uno solo de los dos. Sin ninguno, hereda el de la
+    etapa a la que continua.
+    """
+    if hito:
+        h = buscar_ticket(hito)
+        if not h.es_hito:
+            raise click.ClickException(
+                f"'{h.slug}' no es un hito. Si es una epica, va con --epica; para "
+                f"volverla hito de otra, `factoria hito {h.slug} --epica <epica>`.")
+        hito = h.slug
+    if epica:
+        e = buscar_ticket(epica)
+        if e.es_hito:
+            raise click.ClickException(
+                f"'{e.slug}' es un hito, no una epica: una etapa suya va con "
+                f"--hito {e.slug}.")
+        epica = e.slug
+    if nivel and (hito or not epica):
+        raise click.ClickException("un hito va con --epica <epica>, y sin --hito.")
+    if hito and epica:
+        raise click.ClickException("una etapa cuelga de una epica o de un hito, no de "
+                                   "los dos: el hito ya sabe su epica.")
+    if previo and not (epica or hito):
+        if previo.hito:
+            hito = previo.hito
+        elif not previo.es_hito:
+            epica = previo.epica or None
+    return epica, hito
+
+
 @cli.command()
 @click.argument("slug")
 @click.option("--repo", help="Repo donde arranca. Por defecto, el del directorio actual.")
@@ -2490,17 +2581,22 @@ def _resolver_rama(rp: Path, base: str, actual: str, pedida: str | None,
               help="Forzar o evitar el ritual de worktree del perfil.")
 @click.option("--no-lanzar", is_flag=True, help="Crear el ticket sin abrir la sesion.")
 @click.option("--forzar", is_flag=True, help="Permitir anidar dentro de otra sesion.")
-@click.option("--epica", help="Slug de la epica a la que pertenece esta etapa.")
+@click.option("--epica", help="Slug de la epica a la que pertenece esta etapa, o "
+                                "este hito con --nivel hito.")
+@click.option("--hito", help="Slug del hito al que pertenece esta etapa.")
+@click.option("--nivel", type=click.Choice([NIVEL_HITO]),
+              help="`hito`: el ticket es un hito de la epica de --epica, y duenio "
+                   "de la cadena de sus etapas.")
 @click.option("--continua", "continua",
               help="Slug de la etapa anterior. La rama nace de la rama de esa etapa, "
-                   "y si no se pasa --epica, hereda la suya.")
+                   "y si no se pasa --epica ni --hito, hereda el suyo.")
 @click.option("--push-etapas", type=click.Choice(PUSH_ETAPAS),
-              help="Para el ticket que hace de epica: cuando se pushean sus etapas. "
-                   "Sin esto, al-final.")
+              help="Para el ticket que hace de epica o de hito: cuando se pushean sus "
+                   "etapas. Sin esto, al-final.")
 def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
         rama_pedida: str | None, tipo: str, aqui: bool, worktree: bool | None,
-        no_lanzar: bool, forzar: bool, epica: str | None, continua: str | None,
-        push_etapas: str | None) -> None:
+        no_lanzar: bool, forzar: bool, epica: str | None, hito: str | None,
+        nivel: str | None, continua: str | None, push_etapas: str | None) -> None:
     """Crea un ticket en fase plan y abre su sesion, con id conocido de antemano."""
     crudo, slug = slug, normalizar_slug(slug)
     if not slug:
@@ -2529,18 +2625,16 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     # Se resuelven antes del pedido y de la rama: un slug mal tipeado tiene que
     # fallar antes de abrir el editor o de cambiar de rama, no despues.
     previo = buscar_ticket(continua) if continua else None
-    if epica:
-        epica = buscar_ticket(epica).slug
-    elif previo:
-        epica = previo.epica or None
-    if continua and not epica:
+    epica, hito = _resolver_jerarquia(epica, hito, nivel, previo)
+    if continua and not (epica or hito):
         # Avisa, no bloquea: la rama se encadena igual, pero sin epica no hay
         # agrupado en `board` ni push diferido.
         console.print(f"[yellow]'{previo.slug}' no pertenece a ninguna epica: la rama "
                       "se encadena, pero sin --epica no se agrupa ni difiere el push.[/]")
-    if push_etapas and epica:
-        console.print("[yellow]--push-etapas va en la epica, no en una etapa: en esta "
-                      "no tiene efecto.[/]")
+    es_etapa = bool(hito or (epica and not nivel))
+    if push_etapas and es_etapa:
+        console.print("[yellow]--push-etapas va en la epica o el hito, no en una etapa: "
+                      "en esta no tiene efecto.[/]")
 
     if not pedido:
         pedido = (click.edit(
@@ -2584,8 +2678,9 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     doc = crear_doc(rp.name, slug)
     t = Ticket(
         slug=slug, fase="plan", tipo=tipo, abierto=True, spec_congelado="",
-        epica=epica or "", continua_a=previo.slug if previo else "",
-        push_etapas="" if epica else (push_etapas or ""),
+        epica=epica or "", hito=hito or "", nivel=nivel or "",
+        continua_a=previo.slug if previo else "",
+        push_etapas="" if es_etapa else (push_etapas or ""),
         repos=[RepoTicket(repo=rp.name, cuenta=cta, rama=rama, cwd=cwd,
                           session_id=sid, doc=str(doc),
                           sesiones=[SesionTicket(sid, cta, hoy())])],
@@ -2604,8 +2699,9 @@ def new(slug: str, repo: str | None, cuenta: str | None, pedido: str | None,
     console.print(f"  rama     {rama or '(sin rama)'}")
     if cwd != str(rp):
         console.print(f"  cwd      {cwd}")
-    if epica:
-        console.print(f"  epica    {epica}"
+    if epica or hito:
+        console.print(f"  {'hito' if hito else 'epica'}{'' if hito else '   '} "
+                      f"{hito or epica}" + ("  (este ticket es un hito)" if nivel else "")
                       + (f"  (continua a {previo.slug})" if previo else ""))
     console.print()
     console.print("[dim]En la sesion: escribí los criterios de aceptación, los entregables "
@@ -2806,7 +2902,8 @@ def tickets(todos: bool, tipo_filtro: str | None, como_json: bool) -> None:
         click.echo(json.dumps(
             [{"slug": t.slug, "fase": t.fase, "tipo": t.tipo, "abierto": t.abierto,
               "spec_congelado": t.spec_congelado, "lineas": t.lineas,
-              "epica": t.epica, "continua_a": t.continua_a,
+              "nivel": t.nivel, "epica": t.epica, "hito": t.hito,
+              "continua_a": t.continua_a,
               "repos": [e.a_dict() for e in t.repos]} for t in ts],
             indent=2, ensure_ascii=False))
         return
@@ -2829,8 +2926,8 @@ def tickets(todos: bool, tipo_filtro: str | None, como_json: bool) -> None:
     t_.add_column("issue")
     t_.add_column("lin", justify="right")
     filas, avisos = orden_con_etapas(ts, lambda x: x.slug, tickets_todos())
-    for t, es_etapa in filas:
-        nombre = f"└ {t.slug}" if es_etapa else t.slug
+    for t, prof in filas:
+        nombre = sangria(prof) + t.slug
         if not t.repos:
             t_.add_row(nombre, t.fase, t.tipo, "[red]-[/]", "-", "-", "-",
                        f"#{t.issue}" if t.issue else "-", str(t.lineas))
@@ -2914,6 +3011,9 @@ def cuerpo_issue(t: Ticket) -> str:
     ]
     for e in t.repos:
         partes.append(f"- `{e.repo}` ({e.cuenta}) — rama `{e.rama or '?'}`")
+    if t.padre:
+        partes += ["", (f"**hito de la épica:** `{t.epica}`" if t.es_hito else
+                        f"**parte de:** {t.nombre_dueno.replace(' ', ' `', 1)}`")]
     # `close` deja el cuerpo en una linea y recien despues espeja: sin esto el
     # issue de un ticket cerrado queda con todas las secciones en _(vacío)_.
     fuente = t.cuerpo
@@ -3218,8 +3318,10 @@ def hechos_para_trello(t: Ticket) -> str:
     """Lo que el ticket pide, para describirlo. Sin estado ni commits: eso lo
     muestra el kanban."""
     partes = [f"ticket: {t.slug}  (tipo: {t.tipo})"]
-    if t.epica:
-        partes.append(f"epica: {t.epica}")
+    if t.hito:
+        partes.append(f"hito: {t.hito}")
+    elif t.epica:
+        partes.append(f"{'hito de la epica' if t.es_hito else 'epica'}: {t.epica}")
     for titulo in ("## Pedido crudo", "## Criterios de aceptación", "## Fuera de alcance",
                    "## Entregables de código"):
         if txt := _seccion(t.cuerpo, titulo):
@@ -3910,8 +4012,8 @@ def construir_grafo(reconstruir: bool = False) -> dict:
     for t in ts:
         tid = nodo(f"ticket:{t.slug}", tipo="ticket", fase=t.fase, abierto=t.abierto,
                    issue=t.issue or None, path=str(t.path) if t.path else "")
-        if t.epica in slugs and t.epica != t.slug:
-            arista(tid, nodo(f"ticket:{t.epica}"), "parte_de")
+        if t.padre in slugs and t.padre != t.slug:
+            arista(tid, nodo(f"ticket:{t.padre}"), "parte_de")
         if t.continua_a in slugs and t.continua_a != t.slug:
             arista(tid, nodo(f"ticket:{t.continua_a}"), "continua_a")
         for e in t.repos:
@@ -4151,19 +4253,40 @@ def pack_de_contexto(slug: str, max_vecinos: int = 4) -> str:
 
 
 def _seccion_epica(tk: Ticket) -> list[str]:
-    """La epica y sus etapas en orden, con el estado de cada una.
+    """La epica y sus hitos, y la cadena de etapas en orden, con el estado de
+    cada uno.
 
-    Va para la etapa (las hermanas) y para la epica (todas sus etapas): retomar
-    la etapa 3 sin saber que dejo la 2 es arrancar sin el piso.
+    Va para la etapa (las hermanas), para el hito (su epica y sus etapas) y para
+    la epica (sus hitos y sus etapas): retomar la etapa 3 sin saber que dejo la
+    2 es arrancar sin el piso.
     """
     ts = tickets_todos()
-    slug = tk.epica or tk.slug
+    return _hitos_de_la_epica(tk, ts) + _cadena_de(tk, ts)
+
+
+def _hitos_de_la_epica(tk: Ticket, ts: list[Ticket]) -> list[str]:
+    hito = ticket_por_slug(ts, tk.hito) if tk.hito else (tk if tk.es_hito else None)
+    epica = hito.epica if hito else tk.slug
+    hitos = sorted(hitos_de(epica, ts), key=lambda x: x.slug)
+    if not hitos:
+        return []
+    partes = ["---", "", f"## Epica {epica}", ""]
+    for h in hitos:
+        marca = (" **(este)**" if h.slug == tk.slug else
+                 " **(el de esta etapa)**" if h.slug == tk.hito else "")
+        partes.append(f"- `{h.slug}` -- {h.fase}{marca}")
+    return partes + [""]
+
+
+def _cadena_de(tk: Ticket, ts: list[Ticket]) -> list[str]:
+    slug = tk.dueno or tk.slug
     orden, aviso = etapas_de(slug, ts)
     if not orden:
         return []
-    epica = ticket_por_slug(ts, slug)
-    partes = ["---", "", f"## Epica {slug}", "",
-              f"_push de etapas: {modo_push(epica)}_"
+    dueno = ticket_por_slug(ts, slug)
+    titulo = "Hito" if dueno and dueno.es_hito else "Epica"
+    partes = ["---", "", f"## {titulo} {slug}", "",
+              f"_push de etapas: {modo_push(dueno)}_"
               + (f" -- {aviso}" if aviso else ""), ""]
     for n, t in enumerate(orden, 1):
         marca = " **(esta)**" if t.slug == tk.slug else ""
@@ -4510,6 +4633,42 @@ def aprobar_cmd(slug: str) -> None:
                   "`board` lo marca como spec-drift.[/]")
 
 
+@cli.command("hito")
+@click.argument("slug")
+@click.option("--epica", required=True, help="La epica de la que pasa a ser hito.")
+def hito_cmd(slug: str, epica: str) -> None:
+    """Vuelve hito de otra epica a un ticket que hacia de epica.
+
+    Sus etapas pasan a colgar del hito (`hito:` en vez de `epica:`), con la
+    cadena y el push como estaban. Solo cambia el frontmatter: el cuerpo, y con
+    el la huella del spec, no se tocan.
+    """
+    t, e = buscar_ticket(slug), buscar_ticket(epica)
+    if t.slug == e.slug:
+        raise click.ClickException("un ticket no puede ser hito de si mismo.")
+    if e.es_hito or e.padre:
+        raise click.ClickException(f"'{e.slug}' no es una epica: es parte de {e.padre}.")
+    if t.dueno:
+        raise click.ClickException(
+            f"'{t.slug}' es una etapa de {t.nombre_dueno}: un hito no puede serlo.")
+    if t.es_hito and t.epica == e.slug:
+        console.print(f"[dim]{t.slug} ya era hito de {e.slug}: nada que hacer.[/]")
+        return
+    ts = tickets_todos()
+    etapas = [x for x in ts if x.epica == t.slug and not x.es_hito]
+    t.nivel, t.epica = NIVEL_HITO, e.slug
+    escribir_ticket(t)
+    for x in etapas:
+        x.epica, x.hito = "", t.slug
+        escribir_ticket(x)
+    regenerar_indice()
+    espejar_si_se_puede(t)
+    console.print(f"[bold]{t.slug}[/] es hito de la epica [bold]{e.slug}[/]"
+                  f"  ({_plural(len(etapas), 'etapa')} pasan a colgar del hito)")
+    for x in etapas:
+        console.print(f"  └ {x.slug}")
+
+
 @cli.command("open")
 @click.argument("slug")
 @click.option("--repo", required=True, help="El segundo repo que suma el ticket.")
@@ -4698,12 +4857,12 @@ class PlanPush:
 
 
 def plan_de_push(t: Ticket, ts: list[Ticket]) -> PlanPush:
-    if not t.epica:
+    if not t.dueno:
         return PlanPush()
-    etapas, aviso = etapas_de(t.epica, ts)
+    etapas, aviso = etapas_de(t.dueno, ts)
     abiertas = [x for x in etapas if x.abierto and x.slug != t.slug]
     return PlanPush(etapas=etapas, abiertas=abiertas,
-                    modo=modo_push(ticket_por_slug(ts, t.epica)),
+                    modo=modo_push(ticket_por_slug(ts, t.dueno)),
                     cierra_cadena=not abiertas, aviso=aviso)
 
 
@@ -4758,13 +4917,13 @@ def close_cmd(slug: str, repo: str | None, pushear: bool | None,
     plan = plan_de_push(t, ts)
     diferido = plan.diferido
     if plan.aviso:
-        console.print(f"[yellow]epica {t.epica}: {plan.aviso}.[/]")
+        console.print(f"[yellow]{t.nombre_dueno}: {plan.aviso}.[/]")
     if pushear is None:
         pushear = not diferido
     elif diferido and pushear:
         diferido = False
         console.print("[yellow]--pushear explicito: esta etapa intermedia se pushea "
-                      "aunque la epica sea al-final.[/]")
+                      f"aunque {t.nombre_dueno} sea al-final.[/]")
 
     urls = []
     for e in entradas:
@@ -4791,10 +4950,10 @@ def close_cmd(slug: str, repo: str | None, pushear: bool | None,
                 base = previa
         if diferido:
             console.print(f"[dim]{e.repo}: push diferido: '{e.rama}' se pushea con la "
-                          f"ultima etapa de la epica {t.epica}.[/]")
+                          f"ultima etapa de {t.nombre_dueno}.[/]")
             if limpiar_worktree:
                 console.print("  [yellow]--limpiar-worktree ignorado: la rama sigue viva "
-                              "hasta el cierre de la epica.[/]")
+                              f"hasta el cierre de {t.nombre_dueno}.[/]")
             continue
         pusheada = False
         if pushear and e.rama:
@@ -4860,16 +5019,20 @@ def close_cmd(slug: str, repo: str | None, pushear: bool | None,
                       "Hoy solo existen en este disco:")
         for r, rp in huerfanas:
             console.print(f"  git -C {rp} push -u origin {r}")
-    if t.epica and plan.cierra_cadena:
-        console.print(f"\n[bold]epica {t.epica}[/]: era la ultima etapa abierta, la "
-                      f"epica queda lista para cerrar: [bold]factoria close {t.epica}[/]")
-    elif t.epica:
-        console.print(f"\n[dim]epica {t.epica}: quedan {len(plan.abiertas)} etapas "
+    if t.dueno and plan.cierra_cadena:
+        console.print(f"\n[bold]{t.nombre_dueno}[/]: era la ultima etapa abierta, "
+                      f"queda lista para cerrar: [bold]factoria close {t.dueno}[/]")
+    elif t.dueno:
+        console.print(f"\n[dim]{t.nombre_dueno}: quedan {len(plan.abiertas)} etapas "
                       f"abiertas ({', '.join(x.slug for x in plan.abiertas)}).[/]")
     if (propias := [x for x in etapas_de(t.slug, ts)[0] if x.abierto]):
         # Avisa, no impide: factoria no bloquea en ningun lado menos `aprobar`.
-        console.print(f"\n[yellow]{t.slug} es una epica con {len(propias)} etapas "
-                      f"abiertas: {', '.join(x.slug for x in propias)}.[/]")
+        console.print(f"\n[yellow]{t.slug} es {'un hito' if t.es_hito else 'una epica'} "
+                      f"con {len(propias)} etapas abiertas: "
+                      f"{', '.join(x.slug for x in propias)}.[/]")
+    if (hitos := [x for x in hitos_de(t.slug, ts) if x.abierto]):
+        console.print(f"\n[yellow]{t.slug} es una epica con {len(hitos)} hitos "
+                      f"abiertos: {', '.join(x.slug for x in hitos)}.[/]")
     console.print("\n[dim]factoria no crea el PR ni mergea: eso es tuyo y de los "
                   "revisores.[/]")
     console.print()

@@ -1157,3 +1157,178 @@ def test_resolver_rama_deja_pasar_skip_worktree_que_no_cambia(cadena):
     _g(cadena.repo, "update-index", "--skip-worktree", "env.txt")
     rama = fx._resolver_rama(cadena.repo, "master", "master", None, "y", "chore", False)
     assert rama == "chore/y"
+
+
+# --------------------------------------------------------------------------
+# hitos: el nivel entre la epica y sus etapas, duenio de la cadena
+# --------------------------------------------------------------------------
+
+def test_los_campos_de_hito_sobreviven_al_ida_y_vuelta(tmp_path):
+    t = fx.Ticket(slug="h", nivel="hito", epica="epi", cuerpo="## Pedido crudo\nx\n",
+                  path=tmp_path / "h.md")
+    fx.escribir_ticket(t)
+    antes = t.path.read_bytes()
+    leido = fx.leer_ticket(t.path)
+    assert (leido.nivel, leido.epica, leido.es_hito) == ("hito", "epi", True)
+    assert leido.texto().encode("utf-8") == antes
+
+
+def test_un_ticket_sin_hito_no_estrena_claves_vacias():
+    txt = fx.Ticket(slug="etapa", epica="epi").texto()
+    assert "nivel" not in txt and "hito" not in txt
+
+
+def test_el_hito_no_es_una_etapa_de_su_epica():
+    """Tiene `epica`, pero la cadena es suya: no se encadena con las de la epica."""
+    h = fx.Ticket(slug="h", nivel="hito", epica="epi")
+    etapa = fx.Ticket(slug="e1", hito="h")
+    vieja = fx.Ticket(slug="v1", epica="otra")
+    assert (h.dueno, h.padre) == ("", "epi")
+    assert (etapa.dueno, etapa.padre) == ("h", "h")
+    assert (vieja.dueno, vieja.padre) == ("otra", "otra")
+    assert [t.slug for t in fx.etapas_de("epi", [h, etapa])[0]] == []
+    assert [t.slug for t in fx.etapas_de("h", [h, etapa])[0]] == ["e1"]
+
+
+def test_board_lista_epica_hitos_y_etapas_en_orden():
+    ts = [fx.Ticket(slug="z-epi"),
+          fx.Ticket(slug="b-hito", nivel="hito", epica="z-epi"),
+          fx.Ticket(slug="a-hito", nivel="hito", epica="z-epi"),
+          fx.Ticket(slug="m-dos", hito="a-hito", continua_a="y-uno"),
+          fx.Ticket(slug="y-uno", hito="a-hito"),
+          fx.Ticket(slug="vieja"), fx.Ticket(slug="vieja-1", epica="vieja")]
+    filas, avisos = fx.orden_con_etapas(ts, lambda x: x.slug)
+    assert [(t.slug, p) for t, p in filas] == [
+        ("vieja", 0), ("vieja-1", 1),
+        ("z-epi", 0), ("a-hito", 1), ("y-uno", 2), ("m-dos", 2), ("b-hito", 1)]
+    assert not avisos
+    assert fx.sangria(2) == "  └ " and fx.sangria(0) == ""
+
+
+def test_sin_la_epica_en_la_lista_el_hito_queda_suelto_con_sus_etapas():
+    ts = [fx.Ticket(slug="h", nivel="hito", epica="cerrada"), fx.Ticket(slug="e", hito="h")]
+    filas, _ = fx.orden_con_etapas(ts, lambda x: x.slug)
+    assert [(t.slug, p) for t, p in filas] == [("h", 0), ("e", 1)]
+
+
+def test_new_crea_un_hito_y_una_etapa_del_hito(cadena):
+    cadena.ticket("epi")
+    r = CliRunner().invoke(fx.cli, ["new", "hito1", "--epica", "epi", "--nivel", "hito",
+                                    "--push-etapas", "por-etapa", "--pedido", "x",
+                                    "--no-lanzar", "--aqui"])
+    assert r.exit_code == 0, r.output
+    h = fx.buscar_ticket("hito1")
+    assert (h.nivel, h.epica, h.push_etapas) == ("hito", "epi", "por-etapa")
+    cadena.rama("feature/e1", "master", "uno.txt")
+    cadena.ticket("e1", "feature/e1", hito="hito1")
+    r = CliRunner().invoke(fx.cli, ["new", "e2", "--continua", "e1", "--pedido", "x",
+                                    "--no-lanzar"])
+    assert r.exit_code == 0, r.output
+    e2 = fx.buscar_ticket("e2")
+    assert (e2.hito, e2.epica, e2.continua_a) == ("hito1", "", "e1")   # hereda el hito
+    _g(cadena.repo, "merge-base", "--is-ancestor", "feature/e1", "feature/e2")
+
+
+@pytest.mark.parametrize("args, error", [
+    (["--hito", "epi"], "no es un hito"),
+    (["--epica", "h"], "es un hito"),
+    (["--nivel", "hito"], "va con --epica"),
+    (["--hito", "h", "--epica", "epi"], "no de los dos"),
+])
+def test_new_rechaza_una_jerarquia_mal_armada(cadena, args, error):
+    cadena.ticket("epi")
+    cadena.ticket("h", nivel="hito", epica="epi")
+    r = CliRunner().invoke(fx.cli, ["new", "x", *args, "--pedido", "x", "--no-lanzar"])
+    assert r.exit_code != 0 and error in r.output.replace("\n", " ")
+    assert not (fx.dir_tickets() / "x.md").exists()
+
+
+def _hito_de_dos(cadena, modo=""):
+    cadena.ticket("epi")
+    cadena.ticket("h", nivel="hito", epica="epi", push_etapas=modo)
+    cadena.rama("feature/etapa1", "master", "uno.txt")
+    _g(cadena.repo, "checkout", "-q", "-b", "feature/etapa2", "feature/etapa1")
+    _commit(cadena.repo, "dos.txt")
+    _g(cadena.repo, "checkout", "-q", "master")
+    cadena.ticket("etapa1", "feature/etapa1", hito="h")
+    cadena.ticket("etapa2", "feature/etapa2", hito="h", continua_a="etapa1")
+
+
+def test_las_etapas_de_un_hito_difieren_el_push_como_las_de_una_epica(cadena):
+    _hito_de_dos(cadena)
+    out1 = _close("etapa1")
+    assert "push diferido" in out1 and not _en_remoto(cadena, "feature/etapa1")
+    assert ("defeve", "feature/etapa1") in fx.ramas_diferidas(
+        fx.tickets_todos(), {"defeve": cadena.repo})
+    out2 = _close("etapa2")
+    assert "compare/master...feature/etapa2" in out2
+    assert "hito h" in out2 and "queda lista para cerrar" in out2
+
+
+def test_el_push_por_etapa_lo_decide_el_hito_y_no_la_epica(cadena):
+    _hito_de_dos(cadena, "por-etapa")
+    _close("etapa1")
+    assert _en_remoto(cadena, "feature/etapa1")
+
+
+def test_cerrar_un_hito_con_etapas_abiertas_avisa(cadena):
+    """Avisa, no impide, como la epica."""
+    cadena.rama("feature/epi", "master", "epi.txt")
+    cadena.rama("feature/h", "master", "h.txt")
+    cadena.ticket("epi", "feature/epi")
+    cadena.ticket("h", "feature/h", nivel="hito", epica="epi")
+    cadena.ticket("etapa1", "feature/etapa1", hito="h")
+    cadena.ticket("etapa2", "feature/etapa1", hito="h", continua_a="etapa1")
+    assert "es una epica con 1 hitos abiertos" in _close("epi")
+    assert "es un hito con 2 etapas abiertas" in _close("h")
+
+
+def test_hito_cmd_pasa_una_epica_a_hito_sin_tocar_su_spec(cadena):
+    cuerpo = "## Pedido crudo\nx\n\n## Criterios de aceptación\n\n- [ ] algo\n"
+    cadena.ticket("odoo")
+    vieja = cadena.ticket("fase-0", push_etapas="por-etapa")
+    vieja.cuerpo = cuerpo
+    vieja.spec_congelado = fx.huella_spec(vieja)
+    fx.escribir_ticket(vieja)
+    cadena.ticket("e1", epica="fase-0")
+    cadena.ticket("e2", epica="fase-0", continua_a="e1")
+    cadena.ticket("ajena", epica="otra")
+    r = CliRunner().invoke(fx.cli, ["hito", "fase-0", "--epica", "odoo"])
+    assert r.exit_code == 0, r.output
+    h = fx.buscar_ticket("fase-0")
+    assert (h.nivel, h.epica, h.push_etapas, h.cuerpo.strip()) == ("hito", "odoo", "por-etapa",
+                                                                   cuerpo.strip())
+    assert fx.huella_spec(h) == h.spec_congelado
+    for s in ("e1", "e2"):
+        e = fx.buscar_ticket(s)
+        assert (e.hito, e.epica) == ("fase-0", "")
+    assert fx.buscar_ticket("e2").continua_a == "e1"
+    assert fx.buscar_ticket("ajena").epica == "otra"
+    r = CliRunner().invoke(fx.cli, ["hito", "fase-0", "--epica", "odoo"])
+    assert r.exit_code == 0 and "ya era hito" in r.output
+
+
+def test_hito_cmd_no_vuelve_hito_a_una_etapa(cadena):
+    cadena.ticket("odoo")
+    cadena.ticket("e1", epica="otra")
+    r = CliRunner().invoke(fx.cli, ["hito", "e1", "--epica", "odoo"])
+    assert r.exit_code != 0 and "es una etapa" in r.output
+
+
+def test_el_contexto_del_hito_trae_su_epica_y_sus_etapas(cadena):
+    _hito_de_dos(cadena)
+    cadena.ticket("h2", nivel="hito", epica="epi")
+    txt = "\n".join(fx._seccion_epica(fx.buscar_ticket("h")))
+    assert "## Epica epi" in txt and "`h` -- plan **(este)**" in txt and "`h2`" in txt
+    assert "## Hito h" in txt and "`etapa1`" in txt and "`etapa2`" in txt
+    txt = "\n".join(fx._seccion_epica(fx.buscar_ticket("etapa2")))
+    assert "(el de esta etapa)" in txt and "**(esta)**" in txt
+    txt = "\n".join(fx._seccion_epica(fx.buscar_ticket("epi")))
+    assert "`h`" in txt and "`h2`" in txt and "## Hito" not in txt
+
+
+def test_el_issue_dice_de_que_cuelga():
+    h = fx.Ticket(slug="h", nivel="hito", epica="epi")
+    assert "**hito de la épica:** `epi`" in fx.cuerpo_issue(h)
+    assert "**parte de:** hito `h`" in fx.cuerpo_issue(fx.Ticket(slug="e", hito="h"))
+    assert "parte de" not in fx.cuerpo_issue(fx.Ticket(slug="suelto"))
