@@ -1281,8 +1281,11 @@ def resolver_destino(consulta: str, repo: str | None, cuenta: str | None,
                      elegir: int | None, dias: int, accion: str) -> Destino:
     """El ticket manda: es la clave primaria de una tarea. Solo si el slug no
     matchea ningun ticket se cae a la busqueda por texto sobre las sesiones."""
-    t = next((x for x in tickets_todos()
-              if x.slug == consulta or consulta.lower() in x.slug.lower()), None)
+    ts = tickets_todos()
+    # Exacto primero: por substring, `panel` caia en el primer ticket alfabetico
+    # que lo contuviera aunque existiera uno que se llamara exactamente asi.
+    t = next((x for x in ts if x.slug == consulta), None) or next(
+        (x for x in ts if consulta.lower() in x.slug.lower()), None)
     if t:
         entradas = t.repos
         if repo:
@@ -2947,6 +2950,197 @@ def tickets(todos: bool, tipo_filtro: str | None, como_json: bool) -> None:
 
 
 # --------------------------------------------------------------------------
+# panel: el arbol navegable de tickets. El modelo vive aca y la UI en
+# factoria_panel.py: el arbol se testea sin Textual, y nada que no sea `panel`
+# necesita Textual instalado.
+# --------------------------------------------------------------------------
+
+@dataclass
+class Nodo:
+    """Una fila del arbol. `gate` es un hito del roadmap que todavia no tiene
+    ticket: sale de la tabla `## Hitos` de su epica y no tiene acciones."""
+    tipo: str                       # epica | hito | ticket | gate
+    etiqueta: str
+    ticket: Ticket | None = None
+    hijos: list[Nodo] = field(default_factory=list)
+    detalle: str = ""
+
+
+def hitos_en_gate(t: Ticket) -> list[tuple[str, str]]:
+    """(hito, estado) de las filas de `## Hitos` que todavia no tienen ticket.
+
+    Formato fijo: columnas `hito | estado | ticket`, con `-` en `ticket`. Una
+    tabla con otro encabezado no se lee: mostrar nada es mejor que adivinar.
+    """
+    filas = [x.strip() for x in _seccion(t.cuerpo, "## Hitos").splitlines()
+             if x.strip().startswith("|")]
+    if len(filas) < 3:
+        return []
+
+    def celdas(fila: str) -> list[str]:
+        return [c.strip() for c in fila.strip("|").split("|")]
+
+    enc = [c.lower() for c in celdas(filas[0])]
+    if not {"hito", "estado", "ticket"} <= set(enc):
+        return []
+    ih, ie, it = (enc.index(k) for k in ("hito", "estado", "ticket"))
+    return [(c[ih], c[ie]) for c in map(celdas, filas[2:])
+            if len(c) == len(enc) and c[it] == "-"]
+
+
+def arbol_de_tickets(todos: list[Ticket], cerrados: bool = False) -> list[Nodo]:
+    """Epicas, hitos y etapas como arbol, en el orden de `orden_con_etapas`.
+
+    Es epica todo ticket que no es hito ni etapa y tiene hijos, o hitos en gate.
+    """
+    ts = todos if cerrados else [t for t in todos if t.abierto]
+    filas, _ = orden_con_etapas(ts, lambda x: x.slug, todos)
+    raiz: list[Nodo] = []
+    pila: list[tuple[int, Nodo]] = []
+    for t, prof in filas:
+        n = Nodo(tipo=NIVEL_HITO if t.es_hito else "ticket", etiqueta="", ticket=t)
+        while pila and pila[-1][0] >= prof:
+            pila.pop()
+        (pila[-1][1].hijos if pila else raiz).append(n)
+        pila.append((prof, n))
+
+    def terminar(n: Nodo) -> None:
+        t = n.ticket
+        if n.tipo == "ticket" and not t.padre:
+            n.hijos += [Nodo(tipo="gate", etiqueta=f"{h} (gate)", detalle=e)
+                        for h, e in hitos_en_gate(t)]
+            if n.hijos:
+                n.tipo = "epica"
+        for h in n.hijos:
+            if h.ticket:
+                terminar(h)
+        cuenta = {k: sum(1 for h in n.hijos if h.tipo == k)
+                  for k in ("hito", "ticket", "gate")}
+        partes = [_plural(cuenta["hito"], "hito") if cuenta["hito"] else "",
+                  _plural(cuenta["ticket"], "etapa") if cuenta["ticket"] else "",
+                  f"{cuenta['gate']} en gate" if cuenta["gate"] else ""]
+        resumen = ", ".join(x for x in partes if x)
+        marca = {"epica": "[E] ", "hito": "[H] "}.get(n.tipo, "")
+        n.etiqueta = (f"{marca}{t.slug}  {t.fase}"
+                      + (f"  ({resumen})" if resumen else ""))
+
+    for n in raiz:
+        terminar(n)
+    return raiz
+
+
+def filtrar_arbol(nodos: list[Nodo], texto: str) -> list[Nodo]:
+    """Los nodos cuya etiqueta contiene `texto`, con sus ancestros. Un nodo que
+    matchea se queda con todos sus hijos."""
+    q = texto.lower().strip()
+    if not q:
+        return nodos
+    out = []
+    for n in nodos:
+        hijos = n.hijos if q in n.etiqueta.lower() else filtrar_arbol(n.hijos, q)
+        if q in n.etiqueta.lower() or hijos:
+            out.append(Nodo(n.tipo, n.etiqueta, n.ticket, hijos, n.detalle))
+    return out
+
+
+def criterios_cumplidos(t: Ticket) -> tuple[int, int]:
+    """(tildados, total) de `## Criterios de aceptación`."""
+    lineas = [x.strip() for x in
+              _seccion(cuerpo_vigente(t), "## Criterios de aceptación").splitlines()]
+    hechos = sum(1 for x in lineas if x.lower().startswith("- [x]"))
+    return hechos, hechos + sum(1 for x in lineas if x.startswith("- [ ]"))
+
+
+def vista_previa(n: Nodo) -> str:
+    """El texto del panel derecho. Texto plano: lo muestra sin markup."""
+    if n.tipo == "gate":
+        return (f"{n.etiqueta}\n\nespera gate · {n.detalle}\n\nTodavia no tiene "
+                "ticket: nace cuando pasa el gate, con\n"
+                "factoria new <slug> --epica <epica> --nivel hito")
+    t = n.ticket
+    nivel = {"epica": "epica", "hito": "hito"}.get(n.tipo, "etapa" if t.dueno else "ticket")
+    lineas = [t.slug, f"{nivel} · {t.fase} · spec {_estado_spec(t)}"
+              + ("" if t.abierto else " · cerrado")]
+    if t.padre:
+        lineas.append(f"parte de {t.padre}")
+    lineas += [f"{e.repo} ({e.cuenta})  {e.rama or '(sin rama)'}" for e in t.repos]
+    hechos, total = criterios_cumplidos(t)
+    if total:
+        lineas += ["", f"Criterios {hechos}/{total}"]
+    for e in t.repos:
+        if e.doc and Path(e.doc).is_file():
+            est = _seccion(Path(e.doc).read_text(encoding="utf-8", errors="replace"),
+                           "## Estado actual").strip()
+            if est:
+                lineas += ["", "Estado actual:", *est.splitlines()[:30]]
+    return "\n".join(lineas)
+
+
+def resumen_cierre(t: Ticket, pushear: bool, ts: list[Ticket]) -> list[str]:
+    """Lo que va a hacer `close`, para confirmarlo antes de hacerlo."""
+    plan = plan_de_push(t, ts)
+    out = [f"Cerrar {t.slug} {'con' if pushear else 'sin'} push:", ""]
+    for e in t.repos:
+        out.append(f"  {e.repo}: rama {e.rama or '(sin rama)'}"
+                   + (" -> push a origin" if pushear and e.rama else " -> sin push"))
+    if plan.diferido:
+        out.append(f"  es una etapa intermedia de {t.nombre_dueno}, al-final: "
+                   + ("con push se pushea igual, le gana al modo." if pushear else
+                      "su rama queda sin push hasta la ultima etapa."))
+    abiertos = ([x.slug for x in etapas_de(t.slug, ts)[0] if x.abierto]
+                + [x.slug for x in hitos_de(t.slug, ts) if x.abierto])
+    if abiertos:
+        out.append(f"  tiene {_plural(len(abiertos), 'hijo')} abiertos: "
+                   f"{', '.join(abiertos)} (avisa, no bloquea).")
+    out += ["  archiva el cuerpo en historial/ y lo pasa a cerrado.", "",
+            "Despues muestra los pasos que quedan a mano."]
+    return out
+
+
+@cli.command("panel")
+@click.option("--cerrados", is_flag=True, help="Arrancar mostrando tambien los cerrados.")
+def panel_cmd(cerrados: bool) -> None:
+    """Arbol navegable de tickets: epicas, hitos y etapas, con vista previa y acciones.
+
+    Para una persona en una terminal: un agente usa `tickets`, que no espera
+    teclas.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import factoria_panel
+    except ImportError as err:
+        raise click.ClickException(
+            f"el panel necesita Textual: python -m pip install textual ({err})")
+    accion = factoria_panel.correr(
+        construir=lambda c: arbol_de_tickets(tickets_todos(), c),
+        filtrar=filtrar_arbol, vista_previa=vista_previa,
+        resumen_cierre=lambda t, p: resumen_cierre(t, p, tickets_todos()),
+        cuentas=list(CUENTAS), cerrados=cerrados)
+    ejecutar_accion(accion)
+
+
+def ejecutar_accion(accion: tuple | None) -> None:
+    """Lo que eligio el panel, ya cerrado: Claude no tiene que heredar una
+    pantalla de Textual a medio limpiar.
+
+    Por la linea de comandos de cada uno y no con `ctx.invoke`: click 8.3 no le
+    completa los defaults al comando invocado asi.
+    """
+    if not accion:
+        return
+    nombre, slug, *resto = accion
+    if nombre == "resume":
+        resume.main([slug, "--repo", resto[0]], standalone_mode=False)
+    elif nombre == "nueva":
+        repo, cuenta = resto
+        t = buscar_ticket(slug)
+        _arrancar_fresca(t, _entrada_unica(t, repo, exacto=True), cuenta, False, False)
+    elif nombre == "cerrar":
+        close_cmd.main([slug, "--pushear" if resto[0] else "--sin-pushear"],
+                       standalone_mode=False)
+
+
+# --------------------------------------------------------------------------
 # Espejo a GitHub Issues + Project v2 (paso 5). Una sola via: los .md son
 # canonicos. Si esto falla, el ticket sigue existiendo igual.
 # --------------------------------------------------------------------------
@@ -2997,6 +3191,15 @@ def _seccion(cuerpo: str, encabezado: str) -> str:
     return "\n".join(out).strip()
 
 
+def cuerpo_vigente(t: Ticket) -> str:
+    """El cuerpo con el spec. `close` deja el del ticket en una linea que apunta
+    al historial: sin esto, un ticket cerrado tiene todas las secciones vacias."""
+    hist = DATOS / "historial" / f"{t.slug}.md"
+    if not t.abierto and hist.is_file():
+        return hist.read_text(encoding="utf-8", errors="replace")
+    return t.cuerpo
+
+
 def cuerpo_issue(t: Ticket) -> str:
     """El issue es un espejo legible, no la fuente de verdad. Eso se dice arriba."""
     partes = [
@@ -3014,12 +3217,7 @@ def cuerpo_issue(t: Ticket) -> str:
     if t.padre:
         partes += ["", (f"**hito de la épica:** `{t.epica}`" if t.es_hito else
                         f"**parte de:** {t.nombre_dueno.replace(' ', ' `', 1)}`")]
-    # `close` deja el cuerpo en una linea y recien despues espeja: sin esto el
-    # issue de un ticket cerrado queda con todas las secciones en _(vacío)_.
-    fuente = t.cuerpo
-    hist = DATOS / "historial" / f"{t.slug}.md"
-    if not t.abierto and hist.is_file():
-        fuente = hist.read_text(encoding="utf-8", errors="replace")
+    fuente = cuerpo_vigente(t)
     for enc in ("## Pedido crudo", "## Criterios de aceptación",
                 "## Fuera de alcance", "## Entregables de código",
                 "## Supuestos abiertos"):

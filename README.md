@@ -345,7 +345,32 @@ factoria cotas       # mide las cotas del estándar y SALE CON 1 si alguna se pa
 factoria sesiones --paralelas          # ramas con más de una sesión viva
 factoria grafo --que-toca <archivo>    # quién más tocó eso
 factoria grafo --bloqueos              # la cadena de dependencias cross-repo
+factoria panel       # el árbol navegable, para una persona en una terminal
 ```
+
+### El panel
+
+`factoria panel` es `tickets` para mirar y actuar con el teclado. A la izquierda
+va el árbol: las épicas `[E]`, colapsadas y con el conteo de hijos; adentro sus
+hitos `[H]`, también colapsados; adentro sus etapas. Los hitos que esperan gate
+salen de la tabla `## Hitos` de la épica, de las filas con `-` en la columna
+`ticket`, y se ven en gris, sin acciones. A la derecha, la vista previa del
+ticket marcado: fase, spec, repos y rama, criterios cumplidos y el Estado actual
+de su doc.
+
+| tecla | hace |
+|---|---|
+| `↑` `↓` | mueve |
+| `→` `←` | expande y colapsa (en un hijo, `←` sube al padre) |
+| `⏎` | acciones: **resume**, **nueva sesión** (pregunta la cuenta y queda como responsable), **cerrar** (con o sin push, con un resumen para confirmar) |
+| `/` | busca; `Esc` limpia |
+| `c` | suma o saca los cerrados |
+| `q` | sale |
+
+resume y nueva sesión cierran el panel y abren Claude en la misma terminal. Es
+para una persona: un agente usa `tickets`, que no espera teclas. Necesita
+Textual (`python -m pip install textual`); el resto de factoria no. Anda en
+Windows Terminal y PowerShell; en Git Bash (mintty), no.
 
 ## Mantenimiento
 

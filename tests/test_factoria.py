@@ -1332,3 +1332,232 @@ def test_el_issue_dice_de_que_cuelga():
     assert "**hito de la épica:** `epi`" in fx.cuerpo_issue(h)
     assert "**parte de:** hito `h`" in fx.cuerpo_issue(fx.Ticket(slug="e", hito="h"))
     assert "parte de" not in fx.cuerpo_issue(fx.Ticket(slug="suelto"))
+
+
+# --------------------------------------------------------------------------
+# panel: el modelo del arbol, la UI con el Pilot de Textual y las acciones
+# --------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+
+TABLA_HITOS = """## Pedido crudo
+
+x
+
+## Hitos
+
+| hito | estado | ticket |
+|---|---|---|
+| Fase 0 | dev | [h0](h0.md) |
+| PRO-1 | espera gate | - |
+| PRO-2 | espera gate | - |
+"""
+
+
+def _ts_panel():
+    return [fx.Ticket(slug="odoo", cuerpo=TABLA_HITOS),
+            fx.Ticket(slug="h0", nivel="hito", epica="odoo", fase="dev"),
+            fx.Ticket(slug="e1", hito="h0"),
+            fx.Ticket(slug="e2", hito="h0", continua_a="e1"),
+            fx.Ticket(slug="e0", hito="h0", abierto=False, fase="cerrado"),
+            fx.Ticket(slug="rediseno"), fx.Ticket(slug="r1", epica="rediseno"),
+            fx.Ticket(slug="suelto")]
+
+
+def _forma(nodos):
+    return [(n.tipo, n.ticket.slug if n.ticket else n.etiqueta, _forma(n.hijos))
+            for n in nodos]
+
+
+def test_el_arbol_pone_hitos_dentro_de_la_epica_y_etapas_dentro_del_hito():
+    arbol = fx.arbol_de_tickets(_ts_panel())
+    assert _forma(arbol) == [
+        ("epica", "odoo", [("hito", "h0", [("ticket", "e1", []), ("ticket", "e2", [])]),
+                           ("gate", "PRO-1 (gate)", []), ("gate", "PRO-2 (gate)", [])]),
+        ("epica", "rediseno", [("ticket", "r1", [])]),
+        ("ticket", "suelto", [])]
+    assert arbol[0].etiqueta == "[E] odoo  plan  (1 hito, 2 en gate)"
+    assert arbol[0].hijos[0].etiqueta == "[H] h0  dev  (2 etapas)"
+
+
+def test_con_cerrados_aparecen_las_etapas_cerradas():
+    arbol = fx.arbol_de_tickets(_ts_panel(), cerrados=True)
+    assert [n.ticket.slug for n in arbol[0].hijos[0].hijos] == ["e0", "e1", "e2"]
+
+
+@pytest.mark.parametrize("tabla", [
+    "## Hitos\n\n| fase | ticket |\n|---|---|\n| PRO-1 | - |\n",       # otro encabezado
+    "## Hitos\n\nsin tabla\n",
+    "## Otra\n\n| hito | estado | ticket |\n|---|---|---|\n| PRO-1 | x | - |\n",
+])
+def test_una_tabla_de_hitos_con_otro_formato_no_se_lee(tabla):
+    assert fx.hitos_en_gate(fx.Ticket(slug="e", cuerpo=tabla)) == []
+
+
+def test_filtrar_deja_los_ancestros_y_los_hijos_del_que_matchea():
+    arbol = fx.filtrar_arbol(fx.arbol_de_tickets(_ts_panel()), "e2")
+    assert _forma(arbol) == [("epica", "odoo", [("hito", "h0", [("ticket", "e2", [])])])]
+    arbol = fx.filtrar_arbol(fx.arbol_de_tickets(_ts_panel()), "[h] h0")
+    assert [n.ticket.slug for n in arbol[0].hijos[0].hijos] == ["e1", "e2"]
+
+
+def test_la_vista_previa_cuenta_criterios_y_trae_el_estado_del_doc(tmp_path):
+    doc = tmp_path / "doc.md"
+    doc.write_text("## Estado actual\n\nERP-02 en curso.\n\n## Otra\n\nno\n", encoding="utf-8")
+    t = fx.Ticket(slug="h0", nivel="hito", epica="odoo", fase="dev",
+                  cuerpo="## Criterios de aceptación\n\n- [x] uno\n- [ ] dos\n- [X] tres\n",
+                  repos=[fx.RepoTicket(repo="Integhra", cuenta="personal", rama="main",
+                                       doc=str(doc))])
+    txt = fx.vista_previa(fx.Nodo(tipo="hito", etiqueta="", ticket=t))
+    assert "hito · dev · spec sin aprobar" in txt and "parte de odoo" in txt
+    assert "Integhra (personal)  main" in txt and "Criterios 2/3" in txt
+    assert "ERP-02 en curso." in txt and "no" not in txt.split("Estado actual:")[1]
+
+
+def test_el_resumen_de_cierre_avisa_lo_diferido_y_los_hijos_abiertos():
+    ts = _ts_panel()
+    for t in ts:
+        t.repos = [fx.RepoTicket(repo="defeve", cuenta="dfv", rama=f"feature/{t.slug}")]
+    e1 = fx.ticket_por_slug(ts, "e1")
+    txt = "\n".join(fx.resumen_cierre(e1, False, ts))
+    assert "sin push" in txt and "etapa intermedia de hito h0" in txt
+    txt = "\n".join(fx.resumen_cierre(fx.ticket_por_slug(ts, "h0"), True, ts))
+    assert "-> push a origin" in txt and "2 hijos abiertos: e1, e2" in txt
+
+
+# --- la UI, con el Pilot de Textual -------------------------------------------
+
+def _panel(ts=None, cerrados=False):
+    import factoria_panel
+    ts = _ts_panel() if ts is None else ts
+    return factoria_panel.PanelApp(
+        construir=lambda c: fx.arbol_de_tickets(ts, c), filtrar=fx.filtrar_arbol,
+        vista_previa=fx.vista_previa,
+        resumen_cierre=lambda t, p: fx.resumen_cierre(t, p, ts),
+        cuentas=["dfv", "personal"], cerrados=cerrados)
+
+
+def _correr(app, *teclas, chequeo=None):
+    async def guion():
+        async with app.run_test(size=(140, 40)) as pilot:
+            for tecla in teclas:
+                await pilot.press(tecla)
+                await pilot.pause()
+            if chequeo:
+                chequeo(app)
+    asyncio.run(guion())
+    return app.return_value
+
+
+def _visibles(app):
+    from textual.widgets import Tree
+    arbol = app.query_one(Tree)
+    return [str(arbol.get_node_at_line(i).label) for i in range(arbol.last_line + 1)]
+
+
+def _previa(app):
+    return str(app.query_one("#previa").render())
+
+
+sys.path.insert(0, str(RAIZ))
+
+
+def test_el_panel_arranca_con_las_epicas_colapsadas():
+    def chequeo(app):
+        assert _visibles(app) == ["[E] odoo  plan  (1 hito, 2 en gate)",
+                                  "[E] rediseno  plan  (1 etapa)", "suelto  plan"]
+        assert "epica · plan" in _previa(app)
+    _correr(_panel(), chequeo=chequeo)
+
+
+def test_derecha_expande_izquierda_colapsa_y_las_flechas_mueven_la_previa():
+    def expandido(app):
+        assert _visibles(app)[:4] == ["[E] odoo  plan  (1 hito, 2 en gate)",
+                                      "[H] h0  dev  (2 etapas)", "PRO-1 (gate)", "PRO-2 (gate)"]
+        assert _previa(app).startswith("h0\nhito · dev")
+    _correr(_panel(), "right", "down", chequeo=expandido)
+
+    def colapsado(app):
+        assert len(_visibles(app)) == 3
+    # en un hijo, izquierda sube al padre; en el padre abierto, lo colapsa
+    _correr(_panel(), "right", "down", "left", "left", chequeo=colapsado)
+
+
+def test_buscar_filtra_y_c_suma_los_cerrados():
+    def filtrado(app):
+        assert _visibles(app) == ["[E] odoo  plan  (1 hito, 2 en gate)",
+                                  "[H] h0  dev  (2 etapas)", "e2  plan"]
+    _correr(_panel(), "slash", "e", "2", "enter", chequeo=filtrado)
+
+    def con_cerrados(app):
+        assert "e0  cerrado" in _visibles(app)
+        assert app.sub_title.startswith("abiertos y cerrados")
+    _correr(_panel(), "c", "right", "down", "right", chequeo=con_cerrados)
+
+
+def test_un_hito_en_gate_no_abre_acciones():
+    def chequeo(app):
+        assert len(app.screen_stack) == 1
+    assert _correr(_panel(), "right", "down", "down", "enter", chequeo=chequeo) is None
+
+
+def test_resume_devuelve_la_accion_y_cierra_el_panel():
+    ts = _ts_panel()
+    fx.ticket_por_slug(ts, "suelto").repos = [fx.RepoTicket(repo="defeve", cuenta="dfv")]
+    assert _correr(_panel(ts), "down", "down", "enter", "enter") == ("resume", "suelto",
+                                                                     "defeve")
+
+
+def test_nueva_sesion_pregunta_la_cuenta():
+    ts = _ts_panel()
+    fx.ticket_por_slug(ts, "suelto").repos = [fx.RepoTicket(repo="defeve", cuenta="dfv")]
+    # acciones -> segunda opcion (nueva) -> segunda cuenta (personal)
+    assert _correr(_panel(ts), "down", "down", "enter", "down", "enter", "down",
+                   "enter") == ("nueva", "suelto", "defeve", "personal")
+
+
+def test_cerrar_pide_push_y_confirmacion_y_sin_confirmar_no_hace_nada():
+    ts = _ts_panel()
+    fx.ticket_por_slug(ts, "suelto").repos = [
+        fx.RepoTicket(repo="defeve", cuenta="dfv", rama="feature/suelto")]
+    abrir = ("down", "down", "enter", "down", "down", "enter")   # acciones -> cerrar
+    assert _correr(_panel(ts), *abrir, "down", "enter", "enter") == ("cerrar", "suelto",
+                                                                     False)
+    assert _correr(_panel(ts), *abrir, "enter", "down", "enter") is None   # dijo que no
+
+    def chequeo(app):
+        assert "Cerrar suelto con push" in str(app.screen.query_one("Static").render())
+    _correr(_panel(ts), *abrir, "enter", chequeo=chequeo)
+
+
+# --- lo que factoria hace con la accion ---------------------------------------
+
+def test_ejecutar_la_accion_lanza_resume_nueva_y_close(cadena, monkeypatch, tmp_path):
+    lanzadas = []
+    monkeypatch.setattr(fx, "_lanzar_en", lambda cuenta, cwd, args, *a, **k:
+                        lanzadas.append((cuenta, args)) or True)
+    monkeypatch.setattr(fx, "pack_de_contexto", lambda slug: "pack")
+    monkeypatch.setattr(fx, "CONTEXTOS", tmp_path / "ctx")
+    cadena.rama("feature/x", "master", "x.txt")
+    t = cadena.ticket("x", "feature/x")
+    t.repos[0].session_id = "abc"
+    fx.escribir_ticket(t)
+
+    fx.ejecutar_accion(("resume", "x", "defeve"))
+    assert lanzadas[-1] == ("dfv", ["--session-id", "abc"])
+
+    fx.ejecutar_accion(("nueva", "x", "defeve", "personal"))
+    nueva = fx.buscar_ticket("x").repos[0]
+    assert lanzadas[-1][0] == "personal" and nueva.cuenta == "personal"
+    assert nueva.session_id != "abc"                      # queda como responsable
+
+    fx.ejecutar_accion(("cerrar", "x", False))
+    assert not fx.buscar_ticket("x").abierto
+    assert not _en_remoto(cadena, "feature/x")
+
+
+def test_resume_prefiere_el_slug_exacto_a_uno_que_lo_contiene(cadena):
+    cadena.ticket("a-panel", "feature/a")
+    cadena.ticket("panel", "feature/p")
+    d = fx.resolver_destino("panel", None, None, None, 0, "resume")
+    assert d.ticket.slug == "panel"
