@@ -66,8 +66,8 @@ Los comandos, en el orden en que se usan:
 
 Flags de `new` que importan: `--aqui` (no crear rama, usar la actual),
 `--pedido "…"` (en vez de abrir el editor), `--no-lanzar`, `--tipo fix|chore`, y
-los de épica — `--epica`, `--continua`, `--push-etapas` — que tienen
-[su sección](#épicas-etapas-encadenadas).
+los de épica y hito — `--epica`, `--hito`, `--nivel hito`, `--continua`,
+`--push-etapas` — que tienen [su sección](#épicas-etapas-encadenadas).
 
 ### Qué se declara en `plan`
 
@@ -168,6 +168,32 @@ una épica `al-final` figura como `diferido`, no como riesgo — mientras a la
 cadena le quede una etapa abierta, o si ya quedó contenida en la rama pusheada.
 El grafo mide cada etapa contra la rama de la anterior, así `--que-toca` no le
 atribuye a la etapa 2 lo que hizo la 1.
+
+### Hitos: el nivel del medio
+
+Cuando una épica es tan grande que sus fases tienen gate propio —la de Odoo—,
+cada fase es un **hito**: un ticket común con `nivel: hito` que apunta a su
+épica con `epica:`. Sus etapas apuntan al hito con `hito:` (no con `epica:`),
+y **la cadena de ramas y `push_etapas` viven en el hito**, no en la épica:
+
+```bash
+factoria new integracion-odoo --aqui --pedido "…" --no-lanzar                 # la épica
+factoria new odoo-fase-0 --epica integracion-odoo --nivel hito --pedido "…" --no-lanzar
+factoria new erp-01 --hito odoo-fase-0 --pedido "…" --no-lanzar               # etapa del hito
+factoria new erp-02 --continua erp-01 --pedido "…" --no-lanzar                # hereda el hito
+factoria hito odoo-fase-0 --epica integracion-odoo   # o: volver hito a una épica que ya existía
+```
+
+`factoria hito` solo toca el front matter —el del hito y el de sus etapas—, así
+que la huella del spec no cambia y no hay spec-drift. Las épicas sin hitos
+siguen exactamente como estaban. `board` y `tickets` listan épica → hitos →
+etapas; el grafo tiene la arista `parte_de` en los dos escalones, y
+`contexto <hito>` trae la épica con sus hitos además de la cadena. Cerrar un hito
+con etapas abiertas, o una épica con hitos abiertos, avisa y no bloquea.
+
+Un hito nace cuando pasa su gate; los que todavía no lo pasaron se listan a mano
+en el cuerpo de la épica como `espera gate`. Las dependencias entre hitos
+quedan en el roadmap, no en factoria.
 
 ## Volver a una tarea
 
@@ -294,8 +320,9 @@ matter del ticket:
 | `abierto: false` | issue cerrado |
 
 Los repos van como **label** y no como campo del Project porque un ticket cruza
-repos por naturaleza y un single-select no puede tener N valores. `epica`,
-`continua_a` y `push_etapas` no se espejan: el issue sigue plano.
+repos por naturaleza y un single-select no puede tener N valores. De `epica`,
+`hito` y `nivel` el issue dice solo de qué cuelga, en una línea; `continua_a` y
+`push_etapas` no se espejan, y no hay sub-issues: el Project sigue plano.
 
 Sin red o sin `gh`, **todo comando sigue funcionando** y `board` avisa
 `espejo N tickets abiertos sin issue`. `factoria abrir <slug>` abre el issue en
